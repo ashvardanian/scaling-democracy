@@ -2,6 +2,7 @@ from typing import Sequence
 import random
 
 import numpy as np
+
 from numba import njit, prange
 
 
@@ -87,45 +88,38 @@ def compute_strongest_paths(preferences: np.ndarray) -> np.ndarray:
     return strongest_paths
 
 
-@njit(parallel=True)
-def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
-    """
-    Computes the widest path strengths using the Schulze method and NumBa's JIT compiler.
-    This baseline implementation only parallelizes the outer loop.
+@njit
+def compute_strongest_paths_tile(
+    c: np.ndarray,
+    c_row: int,
+    c_col: int,
+    a: np.ndarray,
+    a_row: int,
+    a_col: int,
+    b: np.ndarray,
+    b_row: int,
+    b_col: int,
+    tile_size: int = 16,
+) -> np.ndarray:
 
-    Space complexity: O(n^2), where n is the number of candidates.
-    Time complexity: O(n^3), where n is the number of candidates.
-    """
-    num_candidates = preferences.shape[0]
+    for k in range(tile_size):
+        for i in range(tile_size):
+            for j in range(tile_size):
+                if (
+                    (c_row + i != c_col + j)
+                    and (a_row + i != a_col + k)
+                    and (b_row + k != b_col + j)
+                ):
+                    c[c_row + i, c_col + j] = max(
+                        c[c_row + i, c_col + j],
+                        min(a[a_row + i, a_col + k], b[b_row + k, b_col + j]),
+                    )
 
-    # Initialize the strongest paths matrix
-    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint64)
-
-    # Step 1: Populate the strongest paths matrix based on direct comparisons
-    for i in prange(num_candidates):
-        for j in range(num_candidates):
-            if i != j:
-                if preferences[i, j] > preferences[j, i]:
-                    strongest_paths[i, j] = preferences[i, j]
-                else:
-                    strongest_paths[i, j] = 0
-
-    # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm
-    for i in prange(num_candidates):
-        for j in range(num_candidates):
-            if i != j:
-                for k in range(num_candidates):
-                    if i != k and j != k:
-                        strongest_paths[j, k] = max(
-                            strongest_paths[j, k],
-                            min(strongest_paths[j, i], strongest_paths[i, k]),
-                        )
-
-    return strongest_paths
+    return c[c_row : c_row + tile_size, c_col : c_col + tile_size]
 
 
-@njit(parallel=True)
-def compute_strongest_paths_numba_tiled(
+@njit
+def compute_strongest_paths_numba(
     preferences: np.ndarray, tile_size: int = 16
 ) -> np.ndarray:
     """
@@ -142,30 +136,94 @@ def compute_strongest_paths_numba_tiled(
     strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.int64)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
-    for i in prange(0, num_candidates, tile_size):
-        for j in range(0, num_candidates, tile_size):
-            for ii in range(i, min(i + tile_size, num_candidates)):
-                for jj in range(j, min(j + tile_size, num_candidates)):
-                    if ii != jj:
-                        if preferences[ii, jj] > preferences[jj, ii]:
-                            strongest_paths[ii, jj] = preferences[ii, jj]
-                        else:
-                            strongest_paths[ii, jj] = 0
+    for i in range(num_candidates):
+        for j in range(num_candidates):
+            if i != j:
+                if preferences[i, j] > preferences[j, i]:
+                    strongest_paths[i, j] = preferences[i, j]
+                else:
+                    strongest_paths[i, j] = 0
 
     # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm with tiling
-    for i in prange(0, num_candidates, tile_size):
-        for j in range(0, num_candidates, tile_size):
-            for k in range(0, num_candidates, tile_size):
-                for ii in range(i, min(i + tile_size, num_candidates)):
-                    for jj in range(j, min(j + tile_size, num_candidates)):
-                        for kk in range(k, min(k + tile_size, num_candidates)):
-                            if ii != kk and jj != kk and ii != jj:
-                                strongest_paths[jj, kk] = max(
-                                    strongest_paths[jj, kk],
-                                    min(
-                                        strongest_paths[jj, ii], strongest_paths[ii, kk]
-                                    ),
-                                )
+    tiles_count = (num_candidates + tile_size - 1) // tile_size
+    for k in range(tiles_count):
+        # Dependent phase
+        k_start = k * tile_size
+        k_end = min(k_start + tile_size, num_candidates)
+        strongest_paths[k_start:k_end, k_start:k_end] = compute_strongest_paths_tile(
+            strongest_paths,
+            k_start,
+            k_start,
+            strongest_paths,
+            k_start,
+            k_start,
+            strongest_paths,
+            k_start,
+            k_start,
+            tile_size,
+        )
+
+        # Partially dependent phase
+        for j in range(tiles_count):
+            if j == k:
+                continue
+            j_start = j * tile_size
+            j_end = min(j_start + tile_size, num_candidates)
+            strongest_paths[k_start:k_end, j_start:j_end] = (
+                compute_strongest_paths_tile(
+                    strongest_paths,
+                    k_start,
+                    j_start,
+                    strongest_paths,
+                    k_start,
+                    k_start,
+                    strongest_paths,
+                    k_start,
+                    j_start,
+                    tile_size,
+                )
+            )
+
+        # Independent phase
+        for i in range(tiles_count):
+            if i == k:
+                continue
+            i_start = i * tile_size
+            i_end = min(i_start + tile_size, num_candidates)
+            strongest_paths[i_start:i_end, k_start:k_end] = (
+                compute_strongest_paths_tile(
+                    strongest_paths,
+                    i_start,
+                    k_start,
+                    strongest_paths,
+                    i_start,
+                    k_start,
+                    strongest_paths,
+                    k_start,
+                    k_start,
+                    tile_size,
+                )
+            )
+
+            for j in range(tiles_count):
+                if j == k:
+                    continue
+                j_start = j * tile_size
+                j_end = min(j_start + tile_size, num_candidates)
+                strongest_paths[i_start:i_end, j_start:j_end] = (
+                    compute_strongest_paths_tile(
+                        strongest_paths,
+                        i_start,
+                        j_start,
+                        strongest_paths,
+                        i_start,
+                        k_start,
+                        strongest_paths,
+                        k_start,
+                        j_start,
+                        tile_size,
+                    )
+                )
 
     return strongest_paths
 
@@ -192,37 +250,55 @@ def get_winner_and_ranking(candidates: list, strongest_paths: np.ndarray):
     return winner, ranked_candidates
 
 
+# Benchmark and comparison code remains the same
 if __name__ == "__main__":
+    import time
 
-    # Example usage:
-    voter_rankings = [
-        np.array([0, 2, 1, 3]),
-        np.array([1, 0, 3, 2]),
-        np.array([2, 1, 0]),  # Incomplete ranking
-        np.array([3, 2, 1, 0]),
-        np.array([0, 1, 2, 3]),
-        np.array([1, 2, 0]),  # Incomplete ranking
-    ]
-
-    # Let's instead generate some random voter rankings
-    num_voters = 1000
-    num_candidates = 4
+    # Generate random voter rankings
+    num_voters = 512
+    num_candidates = 128
     voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
 
     # Build the pairwise preference matrix
     preferences = build_pairwise_preferences(voter_rankings)
 
-    # Compute the strongest paths using the Schulze method
+    # Benchmark compute_strongest_paths
+    start_time = time.time()
     strongest_paths = compute_strongest_paths(preferences)
+    elapsed_time = time.time() - start_time
+    throughput = num_candidates**3 / elapsed_time
+    print(
+        f"paths: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+    )
 
-    # Determine the winner and ranking
+    # Benchmark compute_strongest_paths_numba
+    start_time = time.time()
+    strongest_paths_numba = compute_strongest_paths_numba(preferences)
+    elapsed_time = time.time() - start_time
+    throughput = num_candidates**3 / elapsed_time
+    print(
+        f"paths_numba: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+    )
+
+    # Benchmark compute_strongest_paths_numba_tiled
+    # start_time = time.time()
+    # strongest_paths_numba_tiled = compute_strongest_paths_numba(
+    #     preferences, tile_size=16
+    # )
+    # elapsed_time = time.time() - start_time
+    # throughput = num_candidates**3 / elapsed_time
+    # print(
+    #     f"paths_numba_tiled: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+    # )
+
+    # Verify that the results are the same
+    assert np.array_equal(strongest_paths, strongest_paths_numba)
+    # assert np.array_equal(strongest_paths, strongest_paths_numba_tiled)
+
+    # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))
     winner, ranking = get_winner_and_ranking(candidates, strongest_paths)
 
     # Print the results
-    print("Pairwise preference matrix:")
-    print(preferences)
-    print("\nStrongest paths matrix:")
-    print(strongest_paths)
     print("\nWinner:", winner)
     print("Ranking:", ranking)
