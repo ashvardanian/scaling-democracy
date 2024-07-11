@@ -245,16 +245,16 @@ if __name__ == "__main__":
 
     # Generate random voter rankings
     num_voters = 128
-    num_candidates = 1024 * 64
+    num_candidates = 1024 * 16
     tile_size = 32
     print(
-        f"Generating {num_voters} random voter rankings with {num_candidates} candidates"
+        f"Generating {num_voters:,} random voter rankings with {num_candidates:,} candidates"
     )
 
     # To simplify the benchmark, let's generate a simple square matrix
     # voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
     # preferences = build_pairwise_preferences(voter_rankings)
-    preferences = np.random.randint(0, num_candidates, (num_voters, num_candidates))
+    preferences = np.random.randint(0, num_voters, (num_candidates, num_candidates))
     print(f"Generated voter rankings, proceeding with {get_num_threads()} threads")
 
     # Benchmark compute_strongest_paths
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(
-        f"Serial: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+        f"Serial: {elapsed_time:.4f} seconds, throughput: {throughput:,.2f} candidates^3/sec"
     )
 
     # Benchmark compute_strongest_paths_numba
@@ -274,7 +274,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(
-        f"Parallel: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+        f"Parallel: {elapsed_time:.4f} seconds, throughput: {throughput:,.2f} candidates^3/sec"
     )
 
     # Verify that the results are the same
