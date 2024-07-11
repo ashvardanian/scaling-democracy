@@ -53,6 +53,7 @@ def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarr
     return preferences
 
 
+@njit
 def compute_strongest_paths(preferences: np.ndarray) -> np.ndarray:
     """
     Computes the widest path strengths using the Schulze method.
@@ -99,7 +100,7 @@ def compute_strongest_paths_tile(
     b: np.ndarray,
     b_row: int,
     b_col: int,
-    tile_size: int = 16,
+    tile_size: int,
 ) -> np.ndarray:
 
     for k in range(tile_size):
@@ -118,17 +119,18 @@ def compute_strongest_paths_tile(
     return c[c_row : c_row + tile_size, c_col : c_col + tile_size]
 
 
-@njit
+@njit(parallel=True)
 def compute_strongest_paths_numba(
-    preferences: np.ndarray, tile_size: int = 16
+    preferences: np.ndarray,
+    tile_size: int = 16,
 ) -> np.ndarray:
     """
     Computes the widest path strengths using the Schulze method with tiling for better cache utilization.
     This implementation not only parallelizes the outer loop but also tiles the computation, to maximize
     the utilization of CPU caches.
 
-    Space complexity: O(n^2), where n is the number of candidates.
-    Time complexity: O(n^3), where n is the number of candidates.
+    Space complexity:
+    Time complexity:
     """
     num_candidates = preferences.shape[0]
 
@@ -164,7 +166,7 @@ def compute_strongest_paths_numba(
         )
 
         # Partially dependent phase
-        for j in range(tiles_count):
+        for j in prange(tiles_count):
             if j == k:
                 continue
             j_start = j * tile_size
@@ -185,7 +187,7 @@ def compute_strongest_paths_numba(
             )
 
         # Independent phase
-        for i in range(tiles_count):
+        for i in prange(tiles_count):
             if i == k:
                 continue
             i_start = i * tile_size
@@ -255,9 +257,16 @@ if __name__ == "__main__":
     import time
 
     # Generate random voter rankings
-    num_voters = 512
-    num_candidates = 128
-    voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
+    num_voters = 128
+    num_candidates = 1024
+    print(
+        f"Generating {num_voters} random voter rankings with {num_candidates} candidates"
+    )
+
+    # To simplify the benchmark, let's generate a simple square matrix
+    # voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
+    voter_rankings = np.random.randint(0, num_candidates, (num_voters, num_candidates))
+    print("Generated voter rankings")
 
     # Build the pairwise preference matrix
     preferences = build_pairwise_preferences(voter_rankings)
@@ -268,7 +277,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(
-        f"paths: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+        f"Serial: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
     )
 
     # Benchmark compute_strongest_paths_numba
@@ -277,23 +286,11 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(
-        f"paths_numba: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
+        f"Parallel: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
     )
-
-    # Benchmark compute_strongest_paths_numba_tiled
-    # start_time = time.time()
-    # strongest_paths_numba_tiled = compute_strongest_paths_numba(
-    #     preferences, tile_size=16
-    # )
-    # elapsed_time = time.time() - start_time
-    # throughput = num_candidates**3 / elapsed_time
-    # print(
-    #     f"paths_numba_tiled: {elapsed_time:.4f} seconds, throughput: {throughput:.2f} candidates^3/sec"
-    # )
 
     # Verify that the results are the same
     assert np.array_equal(strongest_paths, strongest_paths_numba)
-    # assert np.array_equal(strongest_paths, strongest_paths_numba_tiled)
 
     # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))
