@@ -3,7 +3,7 @@ import random
 
 import numpy as np
 
-from numba import njit, prange
+from numba import njit, prange, set_num_threads, get_num_threads
 
 
 def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarray:
@@ -101,7 +101,7 @@ def compute_strongest_paths_tile(
     b_row: int,
     b_col: int,
     tile_size: int,
-) -> np.ndarray:
+):
 
     for k in range(tile_size):
         for i in range(tile_size):
@@ -111,12 +111,9 @@ def compute_strongest_paths_tile(
                     and (a_row + i != a_col + k)
                     and (b_row + k != b_col + j)
                 ):
-                    c[c_row + i, c_col + j] = max(
-                        c[c_row + i, c_col + j],
-                        min(a[a_row + i, a_col + k], b[b_row + k, b_col + j]),
-                    )
-
-    return c[c_row : c_row + tile_size, c_col : c_col + tile_size]
+                    replacement = min(a[a_row + i, a_col + k], b[b_row + k, b_col + j])
+                    if replacement > c[c_row + i, c_col + j]:
+                        c[c_row + i, c_col + j] = replacement
 
 
 @njit(parallel=True)
@@ -151,8 +148,7 @@ def compute_strongest_paths_numba(
     for k in range(tiles_count):
         # Dependent phase
         k_start = k * tile_size
-        k_end = min(k_start + tile_size, num_candidates)
-        strongest_paths[k_start:k_end, k_start:k_end] = compute_strongest_paths_tile(
+        compute_strongest_paths_tile(
             strongest_paths,
             k_start,
             k_start,
@@ -170,20 +166,17 @@ def compute_strongest_paths_numba(
             if j == k:
                 continue
             j_start = j * tile_size
-            j_end = min(j_start + tile_size, num_candidates)
-            strongest_paths[k_start:k_end, j_start:j_end] = (
-                compute_strongest_paths_tile(
-                    strongest_paths,
-                    k_start,
-                    j_start,
-                    strongest_paths,
-                    k_start,
-                    k_start,
-                    strongest_paths,
-                    k_start,
-                    j_start,
-                    tile_size,
-                )
+            compute_strongest_paths_tile(
+                strongest_paths,
+                k_start,
+                j_start,
+                strongest_paths,
+                k_start,
+                k_start,
+                strongest_paths,
+                k_start,
+                j_start,
+                tile_size,
             )
 
         # Independent phase
@@ -191,40 +184,34 @@ def compute_strongest_paths_numba(
             if i == k:
                 continue
             i_start = i * tile_size
-            i_end = min(i_start + tile_size, num_candidates)
-            strongest_paths[i_start:i_end, k_start:k_end] = (
-                compute_strongest_paths_tile(
-                    strongest_paths,
-                    i_start,
-                    k_start,
-                    strongest_paths,
-                    i_start,
-                    k_start,
-                    strongest_paths,
-                    k_start,
-                    k_start,
-                    tile_size,
-                )
+            compute_strongest_paths_tile(
+                strongest_paths,
+                i_start,
+                k_start,
+                strongest_paths,
+                i_start,
+                k_start,
+                strongest_paths,
+                k_start,
+                k_start,
+                tile_size,
             )
 
             for j in range(tiles_count):
                 if j == k:
                     continue
                 j_start = j * tile_size
-                j_end = min(j_start + tile_size, num_candidates)
-                strongest_paths[i_start:i_end, j_start:j_end] = (
-                    compute_strongest_paths_tile(
-                        strongest_paths,
-                        i_start,
-                        j_start,
-                        strongest_paths,
-                        i_start,
-                        k_start,
-                        strongest_paths,
-                        k_start,
-                        j_start,
-                        tile_size,
-                    )
+                compute_strongest_paths_tile(
+                    strongest_paths,
+                    i_start,
+                    j_start,
+                    strongest_paths,
+                    i_start,
+                    k_start,
+                    strongest_paths,
+                    k_start,
+                    j_start,
+                    tile_size,
                 )
 
     return strongest_paths
@@ -258,18 +245,17 @@ if __name__ == "__main__":
 
     # Generate random voter rankings
     num_voters = 128
-    num_candidates = 1024
+    num_candidates = 1024 * 64
+    tile_size = 32
     print(
         f"Generating {num_voters} random voter rankings with {num_candidates} candidates"
     )
 
     # To simplify the benchmark, let's generate a simple square matrix
     # voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
-    voter_rankings = np.random.randint(0, num_candidates, (num_voters, num_candidates))
-    print("Generated voter rankings")
-
-    # Build the pairwise preference matrix
-    preferences = build_pairwise_preferences(voter_rankings)
+    # preferences = build_pairwise_preferences(voter_rankings)
+    preferences = np.random.randint(0, num_candidates, (num_voters, num_candidates))
+    print(f"Generated voter rankings, proceeding with {get_num_threads()} threads")
 
     # Benchmark compute_strongest_paths
     start_time = time.time()
@@ -282,7 +268,9 @@ if __name__ == "__main__":
 
     # Benchmark compute_strongest_paths_numba
     start_time = time.time()
-    strongest_paths_numba = compute_strongest_paths_numba(preferences)
+    strongest_paths_numba = compute_strongest_paths_numba(
+        preferences, tile_size=tile_size
+    )
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(
