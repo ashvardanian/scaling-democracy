@@ -1,6 +1,8 @@
-import numpy as np
 from typing import Sequence
 import random
+
+import numpy as np
+from numba import njit, prange
 
 
 def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarray:
@@ -60,7 +62,7 @@ def compute_strongest_paths(preferences: np.ndarray) -> np.ndarray:
     num_candidates = preferences.shape[0]
 
     # Initialize the strongest paths matrix
-    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=int)
+    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint64)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
     for i in range(num_candidates):
@@ -81,6 +83,89 @@ def compute_strongest_paths(preferences: np.ndarray) -> np.ndarray:
                             strongest_paths[j, k],
                             min(strongest_paths[j, i], strongest_paths[i, k]),
                         )
+
+    return strongest_paths
+
+
+@njit(parallel=True)
+def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
+    """
+    Computes the widest path strengths using the Schulze method and NumBa's JIT compiler.
+    This baseline implementation only parallelizes the outer loop.
+
+    Space complexity: O(n^2), where n is the number of candidates.
+    Time complexity: O(n^3), where n is the number of candidates.
+    """
+    num_candidates = preferences.shape[0]
+
+    # Initialize the strongest paths matrix
+    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint64)
+
+    # Step 1: Populate the strongest paths matrix based on direct comparisons
+    for i in prange(num_candidates):
+        for j in range(num_candidates):
+            if i != j:
+                if preferences[i, j] > preferences[j, i]:
+                    strongest_paths[i, j] = preferences[i, j]
+                else:
+                    strongest_paths[i, j] = 0
+
+    # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm
+    for i in prange(num_candidates):
+        for j in range(num_candidates):
+            if i != j:
+                for k in range(num_candidates):
+                    if i != k and j != k:
+                        strongest_paths[j, k] = max(
+                            strongest_paths[j, k],
+                            min(strongest_paths[j, i], strongest_paths[i, k]),
+                        )
+
+    return strongest_paths
+
+
+@njit(parallel=True)
+def compute_strongest_paths_numba_tiled(
+    preferences: np.ndarray, tile_size: int = 16
+) -> np.ndarray:
+    """
+    Computes the widest path strengths using the Schulze method with tiling for better cache utilization.
+    This implementation not only parallelizes the outer loop but also tiles the computation, to maximize
+    the utilization of CPU caches.
+
+    Space complexity: O(n^2), where n is the number of candidates.
+    Time complexity: O(n^3), where n is the number of candidates.
+    """
+    num_candidates = preferences.shape[0]
+
+    # Initialize the strongest paths matrix
+    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.int64)
+
+    # Step 1: Populate the strongest paths matrix based on direct comparisons
+    for i in prange(0, num_candidates, tile_size):
+        for j in range(0, num_candidates, tile_size):
+            for ii in range(i, min(i + tile_size, num_candidates)):
+                for jj in range(j, min(j + tile_size, num_candidates)):
+                    if ii != jj:
+                        if preferences[ii, jj] > preferences[jj, ii]:
+                            strongest_paths[ii, jj] = preferences[ii, jj]
+                        else:
+                            strongest_paths[ii, jj] = 0
+
+    # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm with tiling
+    for i in prange(0, num_candidates, tile_size):
+        for j in range(0, num_candidates, tile_size):
+            for k in range(0, num_candidates, tile_size):
+                for ii in range(i, min(i + tile_size, num_candidates)):
+                    for jj in range(j, min(j + tile_size, num_candidates)):
+                        for kk in range(k, min(k + tile_size, num_candidates)):
+                            if ii != kk and jj != kk and ii != jj:
+                                strongest_paths[jj, kk] = max(
+                                    strongest_paths[jj, kk],
+                                    min(
+                                        strongest_paths[jj, ii], strongest_paths[ii, kk]
+                                    ),
+                                )
 
     return strongest_paths
 
@@ -107,30 +192,37 @@ def get_winner_and_ranking(candidates: list, strongest_paths: np.ndarray):
     return winner, ranked_candidates
 
 
-# Example usage:
-voter_rankings = [
-    np.array([0, 2, 1, 3]),
-    np.array([1, 0, 3, 2]),
-    np.array([2, 1, 0]),  # Incomplete ranking
-    np.array([3, 2, 1, 0]),
-    np.array([0, 1, 2, 3]),
-    np.array([1, 2, 0]),  # Incomplete ranking
-]
+if __name__ == "__main__":
 
-# Build the pairwise preference matrix
-preferences = build_pairwise_preferences(voter_rankings)
+    # Example usage:
+    voter_rankings = [
+        np.array([0, 2, 1, 3]),
+        np.array([1, 0, 3, 2]),
+        np.array([2, 1, 0]),  # Incomplete ranking
+        np.array([3, 2, 1, 0]),
+        np.array([0, 1, 2, 3]),
+        np.array([1, 2, 0]),  # Incomplete ranking
+    ]
 
-# Compute the strongest paths using the Schulze method
-strongest_paths = compute_strongest_paths(preferences)
+    # Let's instead generate some random voter rankings
+    num_voters = 1000
+    num_candidates = 4
+    voter_rankings = [np.random.permutation(num_candidates) for _ in range(num_voters)]
 
-# Determine the winner and ranking
-candidates = list(range(preferences.shape[0]))
-winner, ranking = get_winner_and_ranking(candidates, strongest_paths)
+    # Build the pairwise preference matrix
+    preferences = build_pairwise_preferences(voter_rankings)
 
-# Print the results
-print("Pairwise preference matrix:")
-print(preferences)
-print("\nStrongest paths matrix:")
-print(strongest_paths)
-print("\nWinner:", winner)
-print("Ranking:", ranking)
+    # Compute the strongest paths using the Schulze method
+    strongest_paths = compute_strongest_paths(preferences)
+
+    # Determine the winner and ranking
+    candidates = list(range(preferences.shape[0]))
+    winner, ranking = get_winner_and_ranking(candidates, strongest_paths)
+
+    # Print the results
+    print("Pairwise preference matrix:")
+    print(preferences)
+    print("\nStrongest paths matrix:")
+    print(strongest_paths)
+    print("\nWinner:", winner)
+    print("Ranking:", ranking)
