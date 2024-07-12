@@ -245,7 +245,7 @@ if __name__ == "__main__":
 
     # Generate random voter rankings
     num_voters = 128
-    num_candidates = 1024 * 16
+    num_candidates = 1024 * 4
     tile_size = 32
     print(
         f"Generating {num_voters:,} random voter rankings with {num_candidates:,} candidates"
@@ -285,5 +285,5 @@ if __name__ == "__main__":
     winner, ranking = get_winner_and_ranking(candidates, strongest_paths)
 
     # Print the results
-    print("\nWinner:", winner)
-    print("Ranking:", ranking)
+    print(f"Winner is {winner}")
+    print(f"Ranked {len(ranking)} candidates")
