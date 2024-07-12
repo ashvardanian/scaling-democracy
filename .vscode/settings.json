@@ -2,6 +2,8 @@
     "cSpell.words": [
         "ndarray",
         "numba",
-        "schulze"
+        "prange",
+        "schulze",
+        "Warshall"
     ]
 }

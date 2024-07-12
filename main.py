@@ -22,7 +22,7 @@ def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarr
     count_candidates = max(max(ranking) for ranking in voter_rankings) + 1
 
     # Initialize the preference matrix
-    preferences = np.zeros((count_candidates, count_candidates), dtype=np.uint64)
+    preferences = np.zeros((count_candidates, count_candidates), dtype=np.uint32)
 
     # Process each voter's ranking
     for ranking in voter_rankings:
@@ -64,7 +64,8 @@ def compute_strongest_paths(preferences: np.ndarray) -> np.ndarray:
     num_candidates = preferences.shape[0]
 
     # Initialize the strongest paths matrix
-    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint64)
+    preferences = preferences.astype(np.uint32)
+    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint32)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
     for i in range(num_candidates):
@@ -102,6 +103,13 @@ def compute_strongest_paths_tile(
     b_col: int,
     tile_size: int,
 ):
+    """
+    In-place computation of the widest path path using the Schulze method with tiling for better cache utilization.
+    For input of size (n x n), would perform (n) iterations of quadratic complexity each.
+
+    Time complexity: O(n^3), where n is the tile size.
+    Space complexity: O(n^2), where n is the tile size.
+    """
 
     for k in range(tile_size):
         for i in range(tile_size):
@@ -132,7 +140,8 @@ def compute_strongest_paths_numba(
     num_candidates = preferences.shape[0]
 
     # Initialize the strongest paths matrix
-    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.int64)
+    preferences = preferences.astype(np.uint32)
+    strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint32)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
     for i in range(num_candidates):
@@ -148,6 +157,8 @@ def compute_strongest_paths_numba(
     for k in range(tiles_count):
         # Dependent phase
         k_start = k * tile_size
+
+        # f(S_kk, S_kk, S_kk)
         compute_strongest_paths_tile(
             strongest_paths,
             k_start,
@@ -166,6 +177,7 @@ def compute_strongest_paths_numba(
             if j == k:
                 continue
             j_start = j * tile_size
+            # f(S_kj, S_kk, S_kj)
             compute_strongest_paths_tile(
                 strongest_paths,
                 k_start,
@@ -184,6 +196,7 @@ def compute_strongest_paths_numba(
             if i == k:
                 continue
             i_start = i * tile_size
+            # f(S_ik, S_ik, S_kk)
             compute_strongest_paths_tile(
                 strongest_paths,
                 i_start,
@@ -201,6 +214,7 @@ def compute_strongest_paths_numba(
                 if j == k:
                     continue
                 j_start = j * tile_size
+                # f(S_ij, S_ik, S_kj)
                 compute_strongest_paths_tile(
                     strongest_paths,
                     i_start,
