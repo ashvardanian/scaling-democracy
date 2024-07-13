@@ -117,12 +117,12 @@ void compute_strongest_paths_cuda( //
                         : 0;
 
     candidate_idx_t tiles_count = (num_candidates + cuda_tile_size - 1) / cuda_tile_size;
-    dim3 block_dim(cuda_tile_size, cuda_tile_size, 1);
+    dim3 tile_shape(cuda_tile_size, cuda_tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
-        _step_diagonal<cuda_tile_size><<<1, block_dim>>>(num_candidates, k, strongest_paths);
-        _step_partially_independent<cuda_tile_size><<<tiles_count, block_dim>>>(num_candidates, k, strongest_paths);
-        _step_independent<cuda_tile_size><<<independent_grid, block_dim>>>(num_candidates, k, strongest_paths);
+        _step_diagonal<cuda_tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
+        _step_partially_independent<cuda_tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
+        _step_independent<cuda_tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
     }
 }
 
@@ -181,6 +181,19 @@ static py::array_t<votes_count_t> compute_strongest_paths(py::array_t<votes_coun
 }
 
 PYBIND11_MODULE(scaling_democracy, m) {
-    m.def("sum", [](int a, int b) { return a + b; }); // Test, make sure this works ;)
+
+    m.def("log_devices", []() {
+        int deviceCount;
+        cudaGetDeviceCount(&deviceCount);
+        for (int i = 0; i < deviceCount; i++) {
+            cudaDeviceProp deviceProps;
+            cudaGetDeviceProperties(&deviceProps, i);
+            printf("Device %d: %s\n", i, deviceProps.name);
+            printf("\tSMs: %d\n", deviceProps.multiProcessorCount);
+            printf("\tGlobal mem: %.2fGB\n", static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024 * 1024));
+            printf("\tCUDA Cap: %d.%d\n", deviceProps.major, deviceProps.minor);
+        }
+    }); // Test, make sure this works ;)
+
     m.def("compute_strongest_paths", &compute_strongest_paths);
 }
