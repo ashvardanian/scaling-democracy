@@ -50,6 +50,12 @@ class BuildExt(build_ext):
         include_dirs = self.compiler.include_dirs + ext.include_dirs
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
         output_file = os.path.join(output_dir, "scaling_democracy.o")
+
+        # Turing: -arch=sm_75
+        # Ampere: -arch=sm_86
+        # Ada: -arch=sm_89
+        # Hopper: -arch=sm_90
+        # https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
         cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -arch=sm_86 -Xcompiler -fPIC {include_dirs}"
         os.system(cmd)
 

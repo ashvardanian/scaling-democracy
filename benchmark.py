@@ -4,6 +4,8 @@ from typing import Sequence, Tuple, List
 import numpy as np
 from numba import njit, prange, get_num_threads
 
+from scaling_democracy import compute_strongest_paths as compute_strongest_paths_cuda
+
 tile_size = 16
 num_voters = 128
 num_candidates = 1024
@@ -273,6 +275,11 @@ if __name__ == "__main__":
     strongest_paths = compute_strongest_paths(sub_preferences)
     strongest_paths_numba = compute_strongest_paths_numba(sub_preferences)
     assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
+    print(f"Numba passed the test")
+
+    strongest_paths_cuda = compute_strongest_paths_cuda(sub_preferences)
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+    print(f"CUDA passed the test")
 
     # Serial code:
     start_time = time.time()
@@ -288,6 +295,14 @@ if __name__ == "__main__":
     throughput = num_candidates**3 / elapsed_time
     print(f"Parallel: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
     assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
+
+    # Parallel GPU code:
+    start_time = time.time()
+    strongest_paths_cuda = compute_strongest_paths_cuda(preferences)
+    elapsed_time = time.time() - start_time
+    throughput = num_candidates**3 / elapsed_time
+    print(f"CUDA: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
 
     # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))

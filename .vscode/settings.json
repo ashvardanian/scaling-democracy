@@ -6,5 +6,8 @@
         "prange",
         "schulze",
         "Warshall"
-    ]
+    ],
+    "files.associations": {
+        "random": "cpp"
+    }
 }
