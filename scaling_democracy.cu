@@ -134,4 +134,7 @@ compute_strongest_paths(py::array_t<votes_count_t, py::array::c_style | py::arra
     return result;
 }
 
-PYBIND11_MODULE(scaling_democracy, m) { m.def("compute_strongest_paths", &compute_strongest_paths); }
+PYBIND11_MODULE(scaling_democracy, m) {
+    m.def("sum", [](int a, int b) { return a + b; }); // Test, make sure this works ;)
+    m.def("compute_strongest_paths", &compute_strongest_paths);
+}
