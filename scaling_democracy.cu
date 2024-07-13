@@ -19,139 +19,164 @@ using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
 template <uint32_t cuda_tile_size>
-__host__ __device__ void _process_tile_global(                            //
-    votes_count_t* c, candidate_idx_t c_row, candidate_idx_t c_col,       //
-    votes_count_t const* a, candidate_idx_t a_row, candidate_idx_t a_col, //
-    votes_count_t const* b, candidate_idx_t b_row, candidate_idx_t b_col, //
-    candidate_idx_t const num_candidates) {
-
+__forceinline__ __device__ void _process_tile_cuda( //
+    votes_count_t* c, votes_count_t* a, votes_count_t* b, candidate_idx_t bj, candidate_idx_t bi) {
     for (candidate_idx_t k = 0; k < cuda_tile_size; k++) {
-        for (candidate_idx_t i = 0; i < cuda_tile_size; i++) {
-            for (candidate_idx_t j = 0; j < cuda_tile_size; j++) {
-                if ((c_row + i != c_col + j) && (a_row + i != a_col + k) && (b_row + k != b_col + j)) {
-                    votes_count_t const& a_ik = a[(a_row + i) * num_candidates + a_col + k];
-                    votes_count_t const& b_kj = b[(b_row + k) * num_candidates + b_col + j];
-                    votes_count_t& c_ij = c[(c_row + i) * num_candidates + c_col + j];
-                    c_ij = max(c_ij, min(a_ik, b_kj));
-                }
-            }
-        }
-    }
-}
-
-template <uint32_t cuda_tile_size>
-__device__ void _process_tile_cuda(                                       //
-    votes_count_t* c, candidate_idx_t c_row, candidate_idx_t c_col,       //
-    votes_count_t const* a, candidate_idx_t a_row, candidate_idx_t a_col, //
-    votes_count_t const* b, candidate_idx_t b_row, candidate_idx_t b_col, //
-    candidate_idx_t const num_candidates) {
-
-    __shared__ votes_count_t a_shared[cuda_tile_size][cuda_tile_size];
-    __shared__ votes_count_t b_shared[cuda_tile_size][cuda_tile_size];
-    __shared__ votes_count_t c_shared[cuda_tile_size][cuda_tile_size];
-
-    // Load the tiles into shared memory
-    candidate_idx_t i = threadIdx.x;
-    candidate_idx_t j = threadIdx.y;
-    a_shared[i][j] = a[(a_row + i) * num_candidates + a_col + j];
-    b_shared[i][j] = b[(b_row + i) * num_candidates + b_col + j];
-    c_shared[i][j] = c[(c_row + i) * num_candidates + c_col + j];
-
-    __syncthreads();
-    for (candidate_idx_t k = 0; k < cuda_tile_size; k++) {
-        if ((c_row + i != c_col + j) && (a_row + i != a_col + k) && (b_row + k != b_col + j))
-            c_shared[i][j] = max(c_shared[i][j], min(a_shared[i][k], b_shared[k][j]));
+        votes_count_t smallest = min(a[bi * cuda_tile_size + k], b[k * cuda_tile_size + bj]);
+        c[bi * cuda_tile_size + bj] = max(c[bi * cuda_tile_size + bj], smallest);
         __syncthreads();
     }
-
-    c[(c_row + i) * num_candidates + c_col + j] = c_shared[i][j];
 }
 
 template <uint32_t cuda_tile_size>
-__global__ void _cuda_step_partially_dependent( //
-    votes_count_t* strongest_paths, candidate_idx_t num_candidates, candidate_idx_t k) {
-    candidate_idx_t j = blockIdx.x;
-    if (j == k)
-        return;
+__global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+    candidate_idx_t const bi = threadIdx.y;
+    candidate_idx_t const bj = threadIdx.x;
 
-    candidate_idx_t k_start = k * cuda_tile_size;
-    candidate_idx_t j_start = j * cuda_tile_size;
+    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __syncthreads();
 
-    _process_tile_global<cuda_tile_size>(  //
-        strongest_paths, k_start, j_start, //
-        strongest_paths, k_start, k_start, //
-        strongest_paths, k_start, j_start, num_candidates);
+    c[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+
+    __syncthreads();
+    _process_tile_cuda<cuda_tile_size>(c, c, c, bi, bj);
+    __syncthreads();
+
+    graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
 }
 
 template <uint32_t cuda_tile_size>
-__global__ void _cuda_step_independent( //
-    votes_count_t* strongest_paths, candidate_idx_t num_candidates, candidate_idx_t k) {
-    candidate_idx_t i = blockIdx.x;
+__global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+    candidate_idx_t const i = blockIdx.x;
+    candidate_idx_t const bi = threadIdx.y;
+    candidate_idx_t const bj = threadIdx.x;
+
     if (i == k)
         return;
 
-    candidate_idx_t i_start = i * cuda_tile_size;
-    candidate_idx_t k_start = k * cuda_tile_size;
+    __shared__ votes_count_t a[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t b[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __syncthreads();
 
-    _process_tile_global<cuda_tile_size>(  //
-        strongest_paths, i_start, k_start, //
-        strongest_paths, i_start, k_start, //
-        strongest_paths, k_start, k_start, num_candidates);
+    c[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+    b[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
 
-    for (candidate_idx_t j = 0; j < num_candidates / cuda_tile_size; j++) {
-        if (j == k)
-            continue;
-        candidate_idx_t j_start = j * cuda_tile_size;
+    __syncthreads();
+    _process_tile_cuda<cuda_tile_size>(c, c, b, bi, bj);
+    __syncthreads();
 
-        _process_tile_global<cuda_tile_size>(  //
-            strongest_paths, i_start, j_start, //
-            strongest_paths, i_start, k_start, //
-            strongest_paths, k_start, j_start, num_candidates);
-    }
+    graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
+    c[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + i * cuda_tile_size + bi * n + bj];
+    a[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+
+    __syncthreads();
+    _process_tile_cuda<cuda_tile_size>(c, a, c, bi, bj);
+    __syncthreads();
+
+    graph[k * cuda_tile_size * n + i * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
+}
+
+template <uint32_t cuda_tile_size>
+__global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+    candidate_idx_t const j = blockIdx.x;
+    candidate_idx_t const i = blockIdx.y;
+    candidate_idx_t const bi = threadIdx.y;
+    candidate_idx_t const bj = threadIdx.x;
+
+    if (i == k && j == k)
+        return;
+
+    __shared__ votes_count_t a[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t b[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __syncthreads();
+
+    c[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj];
+    a[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+    b[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj];
+
+    __syncthreads();
+    _process_tile_cuda<cuda_tile_size>(c, a, b, bi, bj);
+    __syncthreads();
+
+    graph[i * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
 }
 
 template <uint32_t cuda_tile_size> //
 void compute_strongest_paths_cuda( //
-    votes_count_t* preferences, candidate_idx_t num_candidates, votes_count_t* strongest_paths) {
+    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride,
+    votes_count_t* strongest_paths) {
 
     for (candidate_idx_t i = 0; i < num_candidates; i++)
         for (candidate_idx_t j = 0; j < num_candidates; j++)
             if (i != j)
                 strongest_paths[i * num_candidates + j] =
-                    preferences[i * num_candidates + j] > preferences[j * num_candidates + i]
-                        ? preferences[i * num_candidates + j]
+                    preferences[i * row_stride + j] > preferences[j * row_stride + i] //
+                        ? preferences[i * row_stride + j]
                         : 0;
 
     candidate_idx_t tiles_count = (num_candidates + cuda_tile_size - 1) / cuda_tile_size;
+    dim3 block_dim(cuda_tile_size, cuda_tile_size, 1);
+    dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
-        candidate_idx_t k_start = k * cuda_tile_size;
-
-        _process_tile_global<cuda_tile_size>(  //
-            strongest_paths, k_start, k_start, //
-            strongest_paths, k_start, k_start, //
-            strongest_paths, k_start, k_start, num_candidates);
-
-        dim3 threads_per_block(cuda_tile_size, cuda_tile_size);
-        dim3 num_blocks(tiles_count, 1);
-
-        _cuda_step_partially_dependent<cuda_tile_size>
-            <<<num_blocks, threads_per_block>>>(strongest_paths, num_candidates, k);
-        _cuda_step_independent<cuda_tile_size><<<num_blocks, threads_per_block>>>(strongest_paths, num_candidates, k);
+        _step_diagonal<cuda_tile_size><<<1, block_dim>>>(num_candidates, k, strongest_paths);
+        _step_partially_independent<cuda_tile_size><<<tiles_count, block_dim>>>(num_candidates, k, strongest_paths);
+        _step_independent<cuda_tile_size><<<independent_grid, block_dim>>>(num_candidates, k, strongest_paths);
     }
 }
 
 static py::array_t<votes_count_t> compute_strongest_paths(py::array_t<votes_count_t, py::array::c_style> preferences) {
     auto buf = preferences.request();
+    if (buf.ndim != 2)
+        throw std::runtime_error("Number of dimensions must be two");
+    if (buf.shape[0] != buf.shape[1])
+        throw std::runtime_error("Preferences matrix must be square");
     auto preferences_ptr = reinterpret_cast<votes_count_t*>(buf.ptr);
     auto num_candidates = static_cast<candidate_idx_t>(buf.shape[0]);
+    auto row_stride = static_cast<candidate_idx_t>(buf.strides[0] / sizeof(votes_count_t));
 
     votes_count_t* strongest_paths_ptr = nullptr;
-    cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
-    cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
+    cudaError_t error;
+    error = cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to allocate memory on device");
 
-    compute_strongest_paths_cuda<32>(preferences_ptr, num_candidates, strongest_paths_ptr);
-    auto result = py::array_t<votes_count_t>({num_candidates, num_candidates}, strongest_paths_ptr);
-    cudaFree(strongest_paths_ptr);
+    cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
+    compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr);
+
+    // Synchronize to ensure all CUDA operations are complete
+    error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) {
+        cudaFree(strongest_paths_ptr);
+        throw std::runtime_error("CUDA operations did not complete successfully");
+    }
+
+    // Allocate NumPy array for the result
+    auto result = py::array_t<votes_count_t>({num_candidates, num_candidates});
+    auto result_buf = result.request();
+    auto result_ptr = reinterpret_cast<votes_count_t*>(result_buf.ptr);
+
+    // Copy data from the GPU to the NumPy array
+    error = cudaMemcpy(result_ptr, strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t),
+                       cudaMemcpyDeviceToHost);
+    if (error != cudaSuccess) {
+        cudaFree(strongest_paths_ptr);
+        throw std::runtime_error("Failed to copy data from device to host");
+    }
+
+    // Synchronize to ensure all CUDA transfers are complete
+    error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) {
+        cudaFree(strongest_paths_ptr);
+        throw std::runtime_error("CUDA transfers did not complete successfully");
+    }
+
+    // Free the GPU memory
+    error = cudaFree(strongest_paths_ptr);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to free memory on device");
+
     return result;
 }
 
