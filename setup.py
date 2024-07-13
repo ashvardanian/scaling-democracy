@@ -76,6 +76,9 @@ ext_modules = [
             get_python_inc(),
             "/usr/local/cuda/include",
             "/usr/include/cuda",
+            "cccl/cub/",
+            "cccl/libcudacxx/include",
+            "cccl/thrust/",
         ],
         library_dirs=[
             "/usr/local/cuda/lib64",

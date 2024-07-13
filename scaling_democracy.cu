@@ -2,12 +2,15 @@
  * @brief  CUDA-accelerated Schulze voting alrogithm implementation.
  * @author Ash Vardanian
  * @date   July 12, 2024
- *
- *
  */
 #include <cstdint>
 
 #include <cuda_runtime.h>
+
+#include <cub/block/block_reduce.cuh>
+#include <cuda/atomic>
+#include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -194,6 +197,15 @@ PYBIND11_MODULE(scaling_democracy, m) {
             printf("\tCUDA Cap: %d.%d\n", deviceProps.major, deviceProps.minor);
         }
     }); // Test, make sure this works ;)
+
+    m.def("reduce", [](py::array_t<float> const& data) -> float {
+        py::buffer_info buf = data.request();
+        if (buf.ndim != 1 || buf.strides[0] != sizeof(float))
+            throw std::runtime_error("Input should be a contiguous 1D float array");
+        float* ptr = static_cast<float*>(buf.ptr);
+        thrust::device_vector<float> d_data(ptr, ptr + buf.size);
+        return thrust::reduce(thrust::device, d_data.begin(), d_data.end(), 0.0f);
+    });
 
     m.def("compute_strongest_paths", &compute_strongest_paths);
 }
