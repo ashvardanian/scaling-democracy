@@ -2,8 +2,8 @@ from typing import Sequence
 import random
 
 import numpy as np
-
-from numba import njit, prange, set_num_threads, get_num_threads
+import cupy as cp
+from numba import njit, prange, get_num_threads
 
 
 def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarray:
@@ -231,6 +231,175 @@ def compute_strongest_paths_numba(
     return strongest_paths
 
 
+cuda_tile_size = 16
+compute_strongest_paths_tile_cuda = """
+__device__
+void compute_strongest_paths_tile_cuda(
+    uint32_t * c, uint32_t c_row, uint32_t c_col,
+    uint32_t const * a, uint32_t a_row, uint32_t a_col,
+    uint32_t const * b, uint32_t b_row, uint32_t b_col,
+    uint32_t const num_candidates) {
+        
+    __shared__ uint32_t a_shared[cuda_tile_size][cuda_tile_size];
+    __shared__ uint32_t b_shared[cuda_tile_size][cuda_tile_size];
+    __shared__ uint32_t c_shared[cuda_tile_size][cuda_tile_size];
+    
+    uint32_t i = threadIdx.x; // Load the tiles into shared memory
+    uint32_t j = threadIdx.y;
+    a_shared[i][j] = a[(a_row + i) * num_candidates + a_col + j];
+    b_shared[i][j] = b[(b_row + i) * num_candidates + b_col + j];
+    c_shared[i][j] = c[(c_row + i) * num_candidates + c_col + j];
+        
+    __syncthreads();
+    for (uint32_t k = 0; k < cuda_tile_size; k++) {
+        if ((c_row + i != c_col + j) && (a_row + i != a_col + k) && (b_row + k != b_col + j))
+            c_shared[i][j] = max(c_shared[i][j], min(a_shared[i][k], b_shared[k][j]));
+        __syncthreads();
+    }
+    
+    c[(c_row + i) * num_candidates + c_col + j] = c_shared[i][j];
+}
+""".replace(
+    "cuda_tile_size", str(cuda_tile_size)
+)
+
+
+compute_strongest_paths_cuda_partials = (
+    compute_strongest_paths_tile_cuda
+    + """
+__global__
+void compute_strongest_paths_cuda_partials(
+    uint32_t * strongest_paths, uint32_t num_candidates, uint32_t k) {
+    
+    uint32_t j = blockIdx.x;
+    if (j == k) return;
+    
+    uint32_t k_start = k * cuda_tile_size;
+    uint32_t j_start = j * cuda_tile_size;
+    
+    compute_strongest_paths_tile_cuda(
+        strongest_paths, k_start, j_start,
+        strongest_paths, k_start, k_start,
+        strongest_paths, k_start, j_start,
+        num_candidates
+    );
+)
+""".replace(
+        "cuda_tile_size", str(cuda_tile_size)
+    )
+)
+
+compute_strongest_paths_cuda_independent = (
+    compute_strongest_paths_tile_cuda
+    + """
+__global__
+void compute_strongest_paths_cuda_independent(
+    uint32_t * strongest_paths, uint32_t num_candidates, uint32_t k) {
+    
+    uint32_t i = blockIdx.x;
+    if (i == k) return;
+    
+    uint32_t i_start = i * cuda_tile_size;
+    uint32_t k_start = k * cuda_tile_size;
+    
+    compute_strongest_paths_tile_cuda(
+        strongest_paths, i_start, k_start,
+        strongest_paths, i_start, k_start,
+        strongest_paths, k_start, k_start,
+        num_candidates
+    );
+    
+    for (uint32_t j = 0; j < num_candidates / cuda_tile_size; j++) {
+        if (j == k) continue;
+        uint32_t j_start = j * cuda_tile_size;
+        
+        compute_strongest_paths_tile_cuda(
+            strongest_paths, i_start, j_start,
+            strongest_paths, i_start, k_start,
+            strongest_paths, k_start, j_start,
+            num_candidates
+        );
+    }
+}
+""".replace(
+        "cuda_tile_size", str(cuda_tile_size)
+    )
+)
+
+
+compute_strongest_paths_cuda_partials_kernel = cp.RawKernel(
+    compute_strongest_paths_cuda_partials,
+    "compute_strongest_paths_cuda_partials",
+)
+compute_strongest_paths_cuda_independent_kernel = cp.RawKernel(
+    compute_strongest_paths_cuda_independent,
+    "compute_strongest_paths_cuda_independent",
+)
+
+
+def compute_strongest_paths_cuda(preferences: np.ndarray) -> np.ndarray:
+    """
+    Computes the widest path strengths using the Schulze method on Nvidia GPUs.
+
+    Space complexity:
+    Time complexity:
+    """
+    num_candidates = preferences.shape[0]
+    tile_size = cuda_tile_size
+
+    # Let's make sure we use unified memory for the GPU
+    cp.cuda.set_allocator(cp.cuda.MemoryPool(cp.cuda.malloc_managed).malloc)
+
+    # Initialize the strongest paths matrix
+    preferences = cp.array(preferences.astype(np.uint32))
+    strongest_paths = cp.zeros((num_candidates, num_candidates), dtype=np.uint32)
+
+    # Step 1: Populate the strongest paths matrix based on direct comparisons
+    for i in range(num_candidates):
+        for j in range(num_candidates):
+            if i != j:
+                if preferences[i, j] > preferences[j, i]:
+                    strongest_paths[i, j] = preferences[i, j]
+                else:
+                    strongest_paths[i, j] = 0
+
+    # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm with tiling
+    tiles_count = (num_candidates + tile_size - 1) // tile_size
+    for k in range(tiles_count):
+        # Dependent phase
+        k_start = k * tile_size
+
+        # f(S_kk, S_kk, S_kk)
+        compute_strongest_paths_tile(
+            strongest_paths,
+            k_start,
+            k_start,
+            strongest_paths,
+            k_start,
+            k_start,
+            strongest_paths,
+            k_start,
+            k_start,
+            tile_size,
+        )
+
+        # Partially dependent phase
+        compute_strongest_paths_cuda_partials_kernel(
+            (tiles_count, 1),  # blocks grid
+            (cuda_tile_size, cuda_tile_size),  # shape of each block
+            (strongest_paths, num_candidates, k),  # function arguments
+        )
+
+        # Independent phase
+        compute_strongest_paths_cuda_independent(
+            (tiles_count, 1),  # blocks grid
+            (cuda_tile_size, cuda_tile_size),  # shape of each block
+            (strongest_paths, num_candidates, k),  # function arguments
+        )
+
+    return strongest_paths.get()
+
+
 def get_winner_and_ranking(candidates: list, strongest_paths: np.ndarray):
     """
     Determines the winner and the overall ranking of candidates based on the strongest paths matrix.
@@ -259,7 +428,7 @@ if __name__ == "__main__":
 
     # Generate random voter rankings
     num_voters = 128
-    num_candidates = 1024 * 4
+    num_candidates = 1024
     tile_size = 32
     print(
         f"Generating {num_voters:,} random voter rankings with {num_candidates:,} candidates"
@@ -271,28 +440,36 @@ if __name__ == "__main__":
     preferences = np.random.randint(0, num_voters, (num_candidates, num_candidates))
     print(f"Generated voter rankings, proceeding with {get_num_threads()} threads")
 
-    # Benchmark compute_strongest_paths
+    # To avoid cold-start and aggregating JIT costs, let's run all functions on tiny inputs first
+    sub_preferences = preferences[: num_candidates // 16, : num_candidates // 16]
+    strongest_paths = compute_strongest_paths(sub_preferences)
+    strongest_paths_numba = compute_strongest_paths_numba(sub_preferences)
+    strongest_paths_cuda = compute_strongest_paths_cuda(sub_preferences)
+    assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+
+    # Serial code:
     start_time = time.time()
     strongest_paths = compute_strongest_paths(preferences)
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
-    print(
-        f"Serial: {elapsed_time:.4f} seconds, throughput: {throughput:,.2f} candidates^3/sec"
-    )
+    print(f"Serial: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
 
-    # Benchmark compute_strongest_paths_numba
+    # Parallel CPU code:
     start_time = time.time()
-    strongest_paths_numba = compute_strongest_paths_numba(
-        preferences, tile_size=tile_size
-    )
+    strongest_paths_numba = compute_strongest_paths_numba(preferences)
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
-    print(
-        f"Parallel: {elapsed_time:.4f} seconds, throughput: {throughput:,.2f} candidates^3/sec"
-    )
+    print(f"Parallel: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
+    assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
 
-    # Verify that the results are the same
-    assert np.array_equal(strongest_paths, strongest_paths_numba)
+    # Parallel GPU code:
+    start_time = time.time()
+    strongest_paths_cuda = compute_strongest_paths_cuda(preferences)
+    elapsed_time = time.time() - start_time
+    throughput = num_candidates**3 / elapsed_time
+    print(f"GPU: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
 
     # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))
