@@ -21,7 +21,7 @@ namespace py = pybind11;
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
-template <uint32_t tile_size>
+template <uint32_t tile_size, bool syncronize = true>
 __forceinline__ __device__ void _process_tile_cuda(       //
     votes_count_t* c, votes_count_t* a, votes_count_t* b, //
     candidate_idx_t bi, candidate_idx_t bj,               //
@@ -30,13 +30,15 @@ __forceinline__ __device__ void _process_tile_cuda(       //
     candidate_idx_t b_row, candidate_idx_t b_col) {
 
     for (candidate_idx_t k = 0; k < tile_size; k++) {
+        votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
         if ((c_row + bi) != (c_col + bj) && //
             (a_row + bi) != (a_col + k) &&  //
-            (b_row + k) != (b_col + bj)) {
-            votes_count_t smallest = min(a[bi * tile_size + k], b[k * tile_size + bj]);
-            c[bi * tile_size + bj] = max(c[bi * tile_size + bj], smallest);
+            (b_row + k) != (b_col + bj) &&  //
+            smallest > c[bi * tile_size + bj]) {
+            c[bi * tile_size + bj] = smallest;
         }
-        __syncthreads();
+        if constexpr (syncronize)
+            __syncthreads();
     }
 }
 
@@ -125,11 +127,11 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     b[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<tile_size>(    //
-        c, a, b, bi, bj,              //
-        i * tile_size, j * tile_size, //
-        i * tile_size, k * tile_size, //
-        k * tile_size, j * tile_size  //
+    _process_tile_cuda<tile_size, false>( //
+        c, a, b, bi, bj,                  //
+        i * tile_size, j * tile_size,     //
+        i * tile_size, k * tile_size,     //
+        k * tile_size, j * tile_size      //
     );
     __syncthreads();
 
