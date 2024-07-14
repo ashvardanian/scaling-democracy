@@ -47,6 +47,7 @@ __forceinline__ __device__ void _process_tile_cuda(       //
     candidate_idx_t a_row, candidate_idx_t a_col,         //
     candidate_idx_t b_row, candidate_idx_t b_col) {
 
+#pragma unroll
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
         if constexpr (may_be_diagonal) {
@@ -166,6 +167,8 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
 
     __syncthreads();
     if (i == j)
+        // We don't need to "synchronize", because A, C, and B tile arguments
+        // are different in the independent state and will address different shared buffers.
         _process_tile_cuda<tile_size, false, true>( //
             c, a, b, bi, bj,                        //
             i * tile_size, j * tile_size,           //
@@ -173,6 +176,10 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
             k * tile_size, j * tile_size            //
         );
     else
+        // We don't need to "synchronize", because A, C, and B tile arguments
+        // are different in the independent state and will address different shared buffers.
+        // We also mark as "non diagonal", because the `i != j`, and in that case
+        // we can avoid some branches.
         _process_tile_cuda<tile_size, false, false>( //
             c, a, b, bi, bj,                         //
             i * tile_size, j * tile_size,            //
@@ -197,6 +204,7 @@ void compute_strongest_paths_cuda( //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride,
     votes_count_t* strongest_paths) {
 
+#pragma omp parallel for collapse(2)
     for (candidate_idx_t i = 0; i < num_candidates; i++)
         for (candidate_idx_t j = 0; j < num_candidates; j++)
             if (i != j)
