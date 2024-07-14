@@ -8,6 +8,7 @@
         "Warshall"
     ],
     "files.associations": {
-        "random": "cpp"
+        "random": "cpp",
+        "charconv": "cpp"
     }
 }
