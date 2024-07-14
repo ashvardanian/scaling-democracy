@@ -172,7 +172,7 @@ def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
             k_start,
         )
 
-        # Partially dependent phase
+        # Partially dependent phase (first of two)
         for j in prange(tiles_count):
             if j == k:
                 continue
@@ -190,7 +190,7 @@ def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
                 j_start,
             )
 
-        # Independent phase
+        # Partially dependent phase (second of two)
         for i in prange(tiles_count):
             if i == k:
                 continue
@@ -208,6 +208,11 @@ def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
                 k_start,
             )
 
+        # Independent phase
+        for i in prange(tiles_count):
+            if i == k:
+                continue
+            i_start = i * tile_size
             for j in range(tiles_count):
                 if j == k:
                     continue
@@ -274,11 +279,11 @@ if __name__ == "__main__":
     sub_preferences = preferences[: num_candidates // 8, : num_candidates // 8]
     strongest_paths = compute_strongest_paths(sub_preferences)
     strongest_paths_numba = compute_strongest_paths_numba(sub_preferences)
-    # assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
+    assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
     print(f"Numba passed the test")
 
     strongest_paths_cuda = compute_strongest_paths_cuda(sub_preferences)
-    # assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
     print(f"CUDA passed the test")
 
     # Serial code:
@@ -294,7 +299,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(f"Parallel: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
-    # assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
+    assert np.array_equal(strongest_paths, strongest_paths_numba), "Results differ"
 
     # Parallel GPU code:
     start_time = time.time()
@@ -302,7 +307,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(f"CUDA: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
-    # assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
 
     # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))
