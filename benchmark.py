@@ -173,24 +173,6 @@ def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
         )
 
         # Partially dependent phase (first of two)
-        for j in prange(tiles_count):
-            if j == k:
-                continue
-            j_start = j * tile_size
-            # f(S_kj, S_kk, S_kj)
-            compute_strongest_paths_tile_numba(
-                strongest_paths,
-                k_start,
-                j_start,
-                strongest_paths,
-                k_start,
-                k_start,
-                strongest_paths,
-                k_start,
-                j_start,
-            )
-
-        # Partially dependent phase (second of two)
         for i in prange(tiles_count):
             if i == k:
                 continue
@@ -206,6 +188,24 @@ def compute_strongest_paths_numba(preferences: np.ndarray) -> np.ndarray:
                 strongest_paths,
                 k_start,
                 k_start,
+            )
+
+        # Partially dependent phase (second of two)
+        for j in prange(tiles_count):
+            if j == k:
+                continue
+            j_start = j * tile_size
+            # f(S_kj, S_kk, S_kj)
+            compute_strongest_paths_tile_numba(
+                strongest_paths,
+                k_start,
+                j_start,
+                strongest_paths,
+                k_start,
+                k_start,
+                strongest_paths,
+                k_start,
+                j_start,
             )
 
         # Independent phase

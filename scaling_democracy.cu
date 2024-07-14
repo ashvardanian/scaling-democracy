@@ -21,34 +21,48 @@ namespace py = pybind11;
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
-template <uint32_t cuda_tile_size>
-__forceinline__ __device__ void _process_tile_cuda( //
-    votes_count_t* c, votes_count_t* a, votes_count_t* b, candidate_idx_t bj, candidate_idx_t bi) {
-    for (candidate_idx_t k = 0; k < cuda_tile_size; k++) {
-        votes_count_t smallest = min(a[bi * cuda_tile_size + k], b[k * cuda_tile_size + bj]);
-        c[bi * cuda_tile_size + bj] = max(c[bi * cuda_tile_size + bj], smallest);
+template <uint32_t tile_size>
+__forceinline__ __device__ void _process_tile_cuda(       //
+    votes_count_t* c, votes_count_t* a, votes_count_t* b, //
+    candidate_idx_t bi, candidate_idx_t bj,               //
+    candidate_idx_t c_row, candidate_idx_t c_col,         //
+    candidate_idx_t a_row, candidate_idx_t a_col,         //
+    candidate_idx_t b_row, candidate_idx_t b_col) {
+
+    for (candidate_idx_t k = 0; k < tile_size; k++) {
+        if ((c_row + bi) != (c_col + bj) && //
+            (a_row + bi) != (a_col + k) &&  //
+            (b_row + k) != (b_col + bj)) {
+            votes_count_t smallest = min(a[bi * tile_size + k], b[k * tile_size + bj]);
+            c[bi * tile_size + bj] = max(c[bi * tile_size + bj], smallest);
+        }
         __syncthreads();
     }
 }
 
-template <uint32_t cuda_tile_size>
+template <uint32_t tile_size>
 __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
 
-    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t c[tile_size * tile_size];
     __syncthreads();
 
-    c[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+    c[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<cuda_tile_size>(c, c, c, bi, bj);
+    _process_tile_cuda<tile_size>(    //
+        c, c, c, bi, bj,              //
+        tile_size * k, tile_size * k, //
+        tile_size * k, tile_size * k, //
+        tile_size * k, tile_size * k  //
+    );
     __syncthreads();
 
-    graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
+    graph[k * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }
 
-template <uint32_t cuda_tile_size>
+template <uint32_t tile_size>
 __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const i = blockIdx.x;
     candidate_idx_t const bi = threadIdx.y;
@@ -57,30 +71,41 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
     if (i == k)
         return;
 
-    __shared__ votes_count_t a[cuda_tile_size * cuda_tile_size];
-    __shared__ votes_count_t b[cuda_tile_size * cuda_tile_size];
-    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t a[tile_size * tile_size];
+    __shared__ votes_count_t b[tile_size * tile_size];
+    __shared__ votes_count_t c[tile_size * tile_size];
     __syncthreads();
 
-    c[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
-    b[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+    // Walking down within a group of adjacent columns
+    c[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
+    b[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<cuda_tile_size>(c, c, b, bi, bj);
+    _process_tile_cuda<tile_size>(    //
+        c, c, b, bi, bj,              //
+        i * tile_size, k * tile_size, //
+        i * tile_size, k * tile_size, //
+        k * tile_size, k * tile_size);
     __syncthreads();
 
-    graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
-    c[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + i * cuda_tile_size + bi * n + bj];
-    a[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
+    // Walking right within a group of adjacent rows
+    graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
+    c[bi * tile_size + bj] = graph[k * tile_size * n + i * tile_size + bi * n + bj];
+    a[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<cuda_tile_size>(c, a, c, bi, bj);
+    _process_tile_cuda<tile_size>(    //
+        c, a, c, bi, bj,              //
+        k * tile_size, i * tile_size, //
+        k * tile_size, k * tile_size, //
+        k * tile_size, i * tile_size  //
+    );
     __syncthreads();
 
-    graph[k * cuda_tile_size * n + i * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
+    graph[k * tile_size * n + i * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }
 
-template <uint32_t cuda_tile_size>
+template <uint32_t tile_size>
 __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const j = blockIdx.x;
     candidate_idx_t const i = blockIdx.y;
@@ -90,23 +115,28 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     if (i == k && j == k)
         return;
 
-    __shared__ votes_count_t a[cuda_tile_size * cuda_tile_size];
-    __shared__ votes_count_t b[cuda_tile_size * cuda_tile_size];
-    __shared__ votes_count_t c[cuda_tile_size * cuda_tile_size];
+    __shared__ votes_count_t a[tile_size * tile_size];
+    __shared__ votes_count_t b[tile_size * tile_size];
+    __shared__ votes_count_t c[tile_size * tile_size];
     __syncthreads();
 
-    c[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj];
-    a[bi * cuda_tile_size + bj] = graph[i * cuda_tile_size * n + k * cuda_tile_size + bi * n + bj];
-    b[bi * cuda_tile_size + bj] = graph[k * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj];
+    c[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
+    a[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
+    b[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<cuda_tile_size>(c, a, b, bi, bj);
+    _process_tile_cuda<tile_size>(    //
+        c, a, b, bi, bj,              //
+        i * tile_size, j * tile_size, //
+        i * tile_size, k * tile_size, //
+        k * tile_size, j * tile_size  //
+    );
     __syncthreads();
 
-    graph[i * cuda_tile_size * n + j * cuda_tile_size + bi * n + bj] = c[bi * cuda_tile_size + bj];
+    graph[i * tile_size * n + j * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }
 
-template <uint32_t cuda_tile_size> //
+template <uint32_t tile_size>      //
 void compute_strongest_paths_cuda( //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride,
     votes_count_t* strongest_paths) {
@@ -119,13 +149,13 @@ void compute_strongest_paths_cuda( //
                         ? preferences[i * row_stride + j]
                         : 0;
 
-    candidate_idx_t tiles_count = (num_candidates + cuda_tile_size - 1) / cuda_tile_size;
-    dim3 tile_shape(cuda_tile_size, cuda_tile_size, 1);
+    candidate_idx_t tiles_count = (num_candidates + tile_size - 1) / tile_size;
+    dim3 tile_shape(tile_size, tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
-        _step_diagonal<cuda_tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
-        _step_partially_independent<cuda_tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
-        _step_independent<cuda_tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
+        _step_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
+        _step_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
+        _step_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
     }
 }
 
@@ -185,6 +215,7 @@ static py::array_t<votes_count_t> compute_strongest_paths(py::array_t<votes_coun
 
 PYBIND11_MODULE(scaling_democracy, m) {
 
+    // Let's show how to wrap `void` functions for basic logging
     m.def("log_devices", []() {
         int deviceCount;
         cudaGetDeviceCount(&deviceCount);
@@ -196,8 +227,9 @@ PYBIND11_MODULE(scaling_democracy, m) {
             printf("\tGlobal mem: %.2fGB\n", static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024 * 1024));
             printf("\tCUDA Cap: %d.%d\n", deviceProps.major, deviceProps.minor);
         }
-    }); // Test, make sure this works ;)
+    });
 
+    // This is how we could have used `thrust::` for higher-level operations
     m.def("reduce", [](py::array_t<float> const& data) -> float {
         py::buffer_info buf = data.request();
         if (buf.ndim != 1 || buf.strides[0] != sizeof(float))

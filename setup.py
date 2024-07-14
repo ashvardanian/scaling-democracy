@@ -1,11 +1,11 @@
+import os
 from setuptools import setup
 from setuptools.extension import Extension
 from setuptools.command.build_ext import build_ext
-import os
-import pybind11
-import numpy as np
 from distutils.sysconfig import get_python_inc, get_python_lib
 
+import pybind11
+import numpy as np
 
 class BuildExt(build_ext):
     def build_extensions(self):
