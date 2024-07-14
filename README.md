@@ -19,12 +19,16 @@ It's a fun project by itself. It might be a good example of using GPUs for combi
 
 ## Throughput
 
-A typical benchmark output comparing serial Numba code to 20 Intel Icelake cores to a 700 Watt SXM Nvidia H100 GPU would be:
+A typical benchmark output comparing serial Numba code to 20 Intel Icelake threads to SXM Nvidia H100 GPU would be:
 
 ```sh
 Generating 128 random voter rankings with 8,192 candidates
 Generated voter rankings, proceeding with 20 threads
 Serial: 454.5124 seconds, 1,209,550,826.73 candidates^3/sec
-Parallel: 67.7169 seconds, 8,118,442,926.81 candidates^3/sec
-CUDA: 2.2137 seconds, 248,345,285,185.57 candidates^3/sec
+Parallel: 68.4111 seconds, 8,036,063,293.27 candidates^3/sec
+CUDA: 1.9802 seconds, 277,620,752,084.85 candidates^3/sec```
 ```
+
+CUDA outperforms the baseline JIT-compiled parallel kernel by a factor of __34.55x__.
+40 core CPU uses ~270 Watts, so 10 cores use ~67.5 Watts.
+Our SXM Nvidia H100 has a ~700 Watt TDP, so 10.37x more power-hungry, meaning the CUDA implementation is 3.33x more power-efficient. 

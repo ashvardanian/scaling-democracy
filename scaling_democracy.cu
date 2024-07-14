@@ -21,7 +21,7 @@ namespace py = pybind11;
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
-template <uint32_t tile_size, bool synchronize = true>
+template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
 __forceinline__ __device__ void _process_tile_cuda(       //
     votes_count_t* c, votes_count_t* a, votes_count_t* b, //
     candidate_idx_t bi, candidate_idx_t bj,               //
@@ -31,12 +31,15 @@ __forceinline__ __device__ void _process_tile_cuda(       //
 
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
-        uint is_not_diagonal_c = (c_row + bi) != (c_col + bj);
-        uint is_not_diagonal_a = (a_row + bi) != (a_col + k);
-        uint is_not_diagonal_b = (b_row + k) != (b_col + bj);
-        uint is_bigger = smallest > c[bi * tile_size + bj];
-        if (is_not_diagonal_c + is_not_diagonal_a + is_not_diagonal_b + is_bigger == 4)
-            c[bi * tile_size + bj] = smallest;
+        if constexpr (may_be_diagonal) {
+            uint is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+            uint is_not_diagonal_a = (a_row + bi) != (a_col + k);
+            uint is_not_diagonal_b = (b_row + k) != (b_col + bj);
+            uint is_bigger = smallest > c[bi * tile_size + bj];
+            if (is_not_diagonal_c + is_not_diagonal_a + is_not_diagonal_b + is_bigger == 4)
+                c[bi * tile_size + bj] = smallest;
+        } else
+            c[bi * tile_size + bj] = umax(c[bi * tile_size + bj], smallest);
         if constexpr (synchronize)
             __syncthreads();
     }
@@ -120,12 +123,20 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     b[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
 
     __syncthreads();
-    _process_tile_cuda<tile_size, false>( //
-        c, a, b, bi, bj,                  //
-        i * tile_size, j * tile_size,     //
-        i * tile_size, k * tile_size,     //
-        k * tile_size, j * tile_size      //
-    );
+    if (i == j)
+        _process_tile_cuda<tile_size, false, true>( //
+            c, a, b, bi, bj,                        //
+            i * tile_size, j * tile_size,           //
+            i * tile_size, k * tile_size,           //
+            k * tile_size, j * tile_size            //
+        );
+    else
+        _process_tile_cuda<tile_size, false, false>( //
+            c, a, b, bi, bj,                         //
+            i * tile_size, j * tile_size,            //
+            i * tile_size, k * tile_size,            //
+            k * tile_size, j * tile_size             //
+        );
 
     graph[i * tile_size * n + j * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }

@@ -283,7 +283,7 @@ if __name__ == "__main__":
     print(f"Numba passed the test")
 
     strongest_paths_cuda = compute_strongest_paths_cuda(sub_preferences)
-    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+    assert np.array_equal(strongest_paths_numba, strongest_paths_cuda), "Results differ"
     print(f"CUDA passed the test")
 
     # Serial code:
@@ -307,11 +307,11 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     throughput = num_candidates**3 / elapsed_time
     print(f"CUDA: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
-    assert np.array_equal(strongest_paths, strongest_paths_cuda), "Results differ"
+    assert np.array_equal(strongest_paths_numba, strongest_paths_cuda), "Results differ"
 
     # Determine the winner and ranking for the final method (they should be the same for all methods)
     candidates = list(range(preferences.shape[0]))
-    winner, ranking = get_winner_and_ranking(candidates, strongest_paths)
+    winner, ranking = get_winner_and_ranking(candidates, strongest_paths_numba)
 
     # Print the results
     print(f"Winner is {winner}")
