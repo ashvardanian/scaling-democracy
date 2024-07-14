@@ -1,4 +1,6 @@
-# Scaling Democracy with GPUs and Algebraic Graph Theory
+# Scaling Democracy
+
+## With GPUs & Algebraic Graph Theory
 
 This repository implements the Schulze voting algorithm using CUDA for hardware acceleration.
 It's built as a single `scaling_democracy.cu` CUDA file, wrapped with PyBind11, and compiled __without__ CMake directly from the `setup.py`.
