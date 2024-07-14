@@ -7,6 +7,7 @@ from distutils.sysconfig import get_python_inc, get_python_lib
 import pybind11
 import numpy as np
 
+
 class BuildExt(build_ext):
     def build_extensions(self):
         self.compiler.src_extensions.append(".cu")
@@ -104,7 +105,7 @@ setup(
     author="Ash Vardanian",
     author_email="1983160+ashvardanian@users.noreply.github.com",
     url="https://github.com/ashvardanian/scaling-democracy",
-    description="A test project using pybind11",
+    description="GPU-accelerated Schulze voting algorithm",
     long_description="",
     ext_modules=ext_modules,
     extras_require={"test": "pytest"},

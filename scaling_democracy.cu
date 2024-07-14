@@ -21,7 +21,7 @@ namespace py = pybind11;
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
-template <uint32_t tile_size, bool syncronize = true>
+template <uint32_t tile_size, bool synchronize = true>
 __forceinline__ __device__ void _process_tile_cuda(       //
     votes_count_t* c, votes_count_t* a, votes_count_t* b, //
     candidate_idx_t bi, candidate_idx_t bj,               //
@@ -31,13 +31,13 @@ __forceinline__ __device__ void _process_tile_cuda(       //
 
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
-        if ((c_row + bi) != (c_col + bj) && //
-            (a_row + bi) != (a_col + k) &&  //
-            (b_row + k) != (b_col + bj) &&  //
-            smallest > c[bi * tile_size + bj]) {
+        uint is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+        uint is_not_diagonal_a = (a_row + bi) != (a_col + k);
+        uint is_not_diagonal_b = (b_row + k) != (b_col + bj);
+        uint is_bigger = smallest > c[bi * tile_size + bj];
+        if (is_not_diagonal_c + is_not_diagonal_a + is_not_diagonal_b + is_bigger == 4)
             c[bi * tile_size + bj] = smallest;
-        }
-        if constexpr (syncronize)
+        if constexpr (synchronize)
             __syncthreads();
     }
 }
@@ -48,8 +48,6 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
     candidate_idx_t const bj = threadIdx.x;
 
     __shared__ votes_count_t c[tile_size * tile_size];
-    __syncthreads();
-
     c[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
@@ -59,7 +57,6 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
         tile_size * k, tile_size * k, //
         tile_size * k, tile_size * k  //
     );
-    __syncthreads();
 
     graph[k * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }
@@ -76,7 +73,6 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
     __shared__ votes_count_t a[tile_size * tile_size];
     __shared__ votes_count_t b[tile_size * tile_size];
     __shared__ votes_count_t c[tile_size * tile_size];
-    __syncthreads();
 
     // Walking down within a group of adjacent columns
     c[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
@@ -88,7 +84,6 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
         i * tile_size, k * tile_size, //
         i * tile_size, k * tile_size, //
         k * tile_size, k * tile_size);
-    __syncthreads();
 
     // Walking right within a group of adjacent rows
     graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
@@ -102,7 +97,6 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
         k * tile_size, k * tile_size, //
         k * tile_size, i * tile_size  //
     );
-    __syncthreads();
 
     graph[k * tile_size * n + i * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }
@@ -120,7 +114,6 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     __shared__ votes_count_t a[tile_size * tile_size];
     __shared__ votes_count_t b[tile_size * tile_size];
     __shared__ votes_count_t c[tile_size * tile_size];
-    __syncthreads();
 
     c[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
     a[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
@@ -133,7 +126,6 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
         i * tile_size, k * tile_size,     //
         k * tile_size, j * tile_size      //
     );
-    __syncthreads();
 
     graph[i * tile_size * n + j * tile_size + bi * n + bj] = c[bi * tile_size + bj];
 }

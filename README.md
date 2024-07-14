@@ -24,7 +24,7 @@ A typical benchmark output comparing serial Numba code to 20 Intel Icelake cores
 ```sh
 Generating 128 random voter rankings with 8,192 candidates
 Generated voter rankings, proceeding with 20 threads
-Serial: 452.1626 seconds, 1,215,836,431.94 candidates^3/sec
-Parallel: 66.8721 seconds, 8,221,007,862.91 candidates^3/sec
-CUDA: 3.5999 seconds, 152,713,704,578.32 candidates^3/sec
+Serial: 454.5124 seconds, 1,209,550,826.73 candidates^3/sec
+Parallel: 67.7169 seconds, 8,118,442,926.81 candidates^3/sec
+CUDA: 2.2137 seconds, 248,345,285,185.57 candidates^3/sec
 ```
