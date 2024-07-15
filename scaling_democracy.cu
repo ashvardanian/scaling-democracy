@@ -25,6 +25,8 @@
 #endif
 
 namespace py = pybind11;
+namespace cde = cuda::device::experimental;
+using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
@@ -277,12 +279,9 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
     __shared__ alignas(128) votes_count_t b[tile_size][tile_size];
     __shared__ alignas(128) votes_count_t c[tile_size][tile_size];
 
-    using barrier = cuda::barrier<cuda::thread_scope_block>;
-    namespace cde = cuda::device::experimental;
-
 #pragma nv_diag_suppress static_var_with_dynamic_init
     // Initialize shared memory barrier with the number of threads participating in the barrier.
-    __shared__ barrier bar;
+    __shared__ barrier_t bar;
     if (threadIdx.x == 0) {
         // We have one thread per tile cell.
         init(&bar, tile_size * tile_size);
@@ -293,7 +292,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
     __syncthreads();
 
     // Only the first thread in the tile invokes the bulk transfers.
-    barrier::arrival_token token;
+    barrier_t::arrival_token token;
     if (threadIdx.x == 0) {
         // Initiate three bulk tensor copies for different part of the graph.
         cde::cp_async_bulk_tensor_2d_global_to_shared(&c, &graph, i * tile_size, j * tile_size, bar);
@@ -434,6 +433,7 @@ void compute_strongest_paths_cuda( //
     uint32_t elem_stride[rank] = {1, 1};
 
     // Create the tensor descriptor.
+    // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
     CUresult res = cuTensorMapEncodeTiled( //
         &strongest_paths_tensor_map,       // CUtensorMap *tensorMap,
@@ -450,7 +450,7 @@ void compute_strongest_paths_cuda( //
         // Swizzling can be used to avoid shared memory bank conflicts.
         CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
         // L2 Promotion can be used to widen the effect of a cache-policy to a wider
-        // set of L2 cache lines.
+        // set of L2 cache lines. Can be 64b, 128b, 256b, or none.
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
         // Any element that is outside of bounds will be set to zero by the TMA transfer.
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
