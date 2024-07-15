@@ -7,12 +7,13 @@
 
 #include <cuda_runtime.h>
 
-#include <cub/block/block_reduce.cuh>
-#include <cuda/atomic>
+#include <cuda.h> // `CUtensorMap`
+#include <cuda/barrier>
+#include <cudaTypedefs.h> // `PFN_cuTensorMapEncodeTiled`
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 
-#include <pybind11/numpy.h>
+#include <pybind11/numpy.h> // `array_t`
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -252,6 +253,137 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
 }
 
 /**
+ * @brief Performs then independent step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
+ *
+ * @tparam tile_size The size of the tile to be processed.
+ * @param n The number of candidates.
+ * @param k The index of the current tile being processed.
+ * @param graph The graph of strongest paths represented as a `CUtensorMap`.
+ */
+template <uint32_t tile_size>
+__global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
+                                         __grid_constant__ CUtensorMap const graph) {
+    candidate_idx_t const j = blockIdx.x;
+    candidate_idx_t const i = blockIdx.y;
+    candidate_idx_t const bi = threadIdx.y;
+    candidate_idx_t const bj = threadIdx.x;
+
+#if defined(SCALING_DEMOCRACY_HOPPER)
+
+    if (i == k && j == k)
+        return;
+
+    __shared__ alignas(128) votes_count_t a[tile_size][tile_size];
+    __shared__ alignas(128) votes_count_t b[tile_size][tile_size];
+    __shared__ alignas(128) votes_count_t c[tile_size][tile_size];
+
+    using barrier = cuda::barrier<cuda::thread_scope_block>;
+    namespace cde = cuda::device::experimental;
+
+#pragma nv_diag_suppress static_var_with_dynamic_init
+    // Initialize shared memory barrier with the number of threads participating in the barrier.
+    __shared__ barrier bar;
+    if (threadIdx.x == 0) {
+        // We have one thread per tile cell.
+        init(&bar, tile_size * tile_size);
+        // Make initialized barrier visible in async proxy.
+        cde::fence_proxy_async_shared_cta();
+    }
+    // Syncthreads so initialized barrier is visible to all threads.
+    __syncthreads();
+
+    // Only the first thread in the tile invokes the bulk transfers.
+    barrier::arrival_token token;
+    if (threadIdx.x == 0) {
+        // Initiate three bulk tensor copies for different part of the graph.
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&c, &graph, i * tile_size, j * tile_size, bar);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&a, &graph, i * tile_size, k * tile_size, bar);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&b, &graph, k * tile_size, j * tile_size, bar);
+        // Arrive on the barrier and tell how many bytes are expected to come in.
+        token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(c) + sizeof(a) + sizeof(b));
+    } else {
+        // Other threads just arrive.
+        token = bar.arrive(1);
+    }
+
+    // Wait for the data to have arrived.
+    // After this point we expect shared memory to contain the following data:
+    //
+    //  c[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
+    //  a[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
+    //  b[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
+    bar.wait(std::move(token));
+
+    if (i == j)
+        // We don't need to "synchronize", because A, C, and B tile arguments
+        // are different in the independent state and will address different shared buffers.
+        _process_tile_cuda<tile_size, false, true>( //
+            &c[0][0], &a[0][0], &b[0][0], bi, bj,   //
+            i * tile_size, j * tile_size,           //
+            i * tile_size, k * tile_size,           //
+            k * tile_size, j * tile_size            //
+        );
+    else
+        // We don't need to "synchronize", because A, C, and B tile arguments
+        // are different in the independent state and will address different shared buffers.
+        // We also mark as "non diagonal", because the `i != j`, and in that case
+        // we can avoid some branches.
+        _process_tile_cuda<tile_size, false, false>( //
+            &c[0][0], &a[0][0], &b[0][0], bi, bj,    //
+            i * tile_size, j * tile_size,            //
+            i * tile_size, k * tile_size,            //
+            k * tile_size, j * tile_size             //
+        );
+
+    // Wait for shared memory writes to be visible to TMA engine.
+    cde::fence_proxy_async_shared_cta();
+    __syncthreads();
+    // After syncthreads, writes by all threads are visible to TMA engine.
+
+    // Initiate TMA transfer to copy shared memory to global memory
+    if (threadIdx.x == 0) {
+        cde::cp_async_bulk_tensor_2d_shared_to_global(&graph, i * tile_size, j * tile_size, &c);
+        // Wait for TMA transfer to have finished reading shared memory.
+        // Create a "bulk async-group" out of the previous bulk copy operation.
+        cde::cp_async_bulk_commit_group();
+        // Wait for the group to have completed reading from shared memory.
+        cde::cp_async_bulk_wait_group_read<0>();
+
+        // Destroy barrier. This invalidates the memory region of the barrier. If
+        // further computations were to take place in the kernel, this allows the
+        // memory location of the shared memory barrier to be reused.
+        (&bar)->~barrier();
+    }
+#else
+    // This is a trap :)
+    if (i == 0 && j == 0 && bi == 0 && bj == 0)
+        printf("This kernel is only supported on Hopper and newer GPUs\n");
+#endif
+}
+
+PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
+    // Get pointer to cuGetProcAddress
+    cudaDriverEntryPointQueryResult driver_status;
+    void* cuGetProcAddress_ptr = nullptr;
+    cudaError_t error =
+        cudaGetDriverEntryPoint("cuGetProcAddress", &cuGetProcAddress_ptr, cudaEnableDefault, &driver_status);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to get cuGetProcAddress");
+    if (driver_status != cudaDriverEntryPointSuccess)
+        throw std::runtime_error("Failed to get cuGetProcAddress entry point");
+    PFN_cuGetProcAddress_v12000 cuGetProcAddress = reinterpret_cast<PFN_cuGetProcAddress_v12000>(cuGetProcAddress_ptr);
+
+    // Use cuGetProcAddress to get a pointer to the CTK 12.0 version of cuTensorMapEncodeTiled
+    CUdriverProcAddressQueryResult symbol_status;
+    void* cuTensorMapEncodeTiled_ptr = nullptr;
+    CUresult res = cuGetProcAddress("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, 12000,
+                                    CU_GET_PROC_ADDRESS_DEFAULT, &symbol_status);
+    if (res != CUDA_SUCCESS || symbol_status != CU_GET_PROC_ADDRESS_SUCCESS)
+        throw std::runtime_error("Failed to get cuTensorMapEncodeTiled");
+    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(cuTensorMapEncodeTiled_ptr);
+}
+
+/**
  * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  * @tparam tile_size The size of the tile to be processed.
@@ -274,13 +406,70 @@ void compute_strongest_paths_cuda( //
                         ? preferences[i * row_stride + j]
                         : 0;
 
+    // Check if we can use newer CUDA features.
+    cudaError_t error;
+    int current_device;
+    cudaDeviceProp device_props;
+    error = cudaGetDevice(&current_device);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to get current device");
+    error = cudaGetDeviceProperties(&device_props, current_device);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to get device properties");
+    bool supports_tma = device_props.major >= 9;
+    printf("Device %d supports TMA: %s\n", current_device, supports_tma ? "yes" : "no");
+
+    CUtensorMap strongest_paths_tensor_map{};
+    // rank is the number of dimensions of the array.
+    constexpr uint32_t rank = 2;
+    uint64_t size[rank] = {num_candidates, num_candidates};
+    // The stride is the number of bytes to traverse from the first element of one row to the next.
+    // It must be a multiple of 16.
+    uint64_t stride[rank - 1] = {num_candidates * sizeof(votes_count_t)};
+    // The box_size is the size of the shared memory buffer that is used as the
+    // destination of a TMA transfer.
+    uint32_t box_size[rank] = {tile_size, tile_size};
+    // The distance between elements in units of sizeof(element). A stride of 2
+    // can be used to load only the real component of a complex-valued tensor, for instance.
+    uint32_t elem_stride[rank] = {1, 1};
+
+    // Create the tensor descriptor.
+    PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
+    CUresult res = cuTensorMapEncodeTiled( //
+        &strongest_paths_tensor_map,       // CUtensorMap *tensorMap,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+        rank,            // cuuint32_t tensorRank,
+        strongest_paths, // void *globalAddress,
+        size,            // const cuuint64_t *globalDim,
+        stride,          // const cuuint64_t *globalStrides,
+        box_size,        // const cuuint32_t *boxDim,
+        elem_stride,     // const cuuint32_t *elementStrides,
+        // Interleave patterns can be used to accelerate loading of values that
+        // are less than 4 bytes long.
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        // Swizzling can be used to avoid shared memory bank conflicts.
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        // L2 Promotion can be used to widen the effect of a cache-policy to a wider
+        // set of L2 cache lines.
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        // Any element that is outside of bounds will be set to zero by the TMA transfer.
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
     candidate_idx_t tiles_count = (num_candidates + tile_size - 1) / tile_size;
     dim3 tile_shape(tile_size, tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
         _step_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
         _step_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
-        _step_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
+        if (supports_tma)
+            _step_independent_hopper<tile_size>
+                <<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths_tensor_map);
+        else
+            _step_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
+
+        error = cudaGetLastError();
+        if (error != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(error));
     }
 }
 
@@ -348,15 +537,19 @@ PYBIND11_MODULE(scaling_democracy, m) {
 
     // Let's show how to wrap `void` functions for basic logging
     m.def("log_devices", []() {
-        int deviceCount;
-        cudaGetDeviceCount(&deviceCount);
-        for (int i = 0; i < deviceCount; i++) {
-            cudaDeviceProp deviceProps;
-            cudaGetDeviceProperties(&deviceProps, i);
-            printf("Device %d: %s\n", i, deviceProps.name);
-            printf("\tSMs: %d\n", deviceProps.multiProcessorCount);
-            printf("\tGlobal mem: %.2fGB\n", static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024 * 1024));
-            printf("\tCUDA Cap: %d.%d\n", deviceProps.major, deviceProps.minor);
+        int device_count;
+        cudaDeviceProp device_props;
+        cudaError_t error = cudaGetDeviceCount(&device_count);
+        if (error != cudaSuccess)
+            throw std::runtime_error("Failed to get device count");
+        for (int i = 0; i < device_count; i++) {
+            error = cudaGetDeviceProperties(&device_props, i);
+            if (error != cudaSuccess)
+                throw std::runtime_error("Failed to get device properties");
+            printf("Device %d: %s\n", i, device_props.name);
+            printf("\tSMs: %d\n", device_props.multiProcessorCount);
+            printf("\tGlobal mem: %.2fGB\n", static_cast<float>(device_props.totalGlobalMem) / (1024 * 1024 * 1024));
+            printf("\tCUDA Cap: %d.%d\n", device_props.major, device_props.minor);
         }
     });
 

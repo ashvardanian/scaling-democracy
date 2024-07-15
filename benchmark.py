@@ -307,6 +307,13 @@ if __name__ == "__main__":
         throughput = num_candidates**3 / elapsed_time
         print(f"Serial: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
 
+    # Parallel GPU code:
+    start_time = time.time()
+    strongest_paths_cuda = compute_strongest_paths_cuda(preferences)
+    elapsed_time = time.time() - start_time
+    throughput = num_candidates**3 / elapsed_time
+    print(f"CUDA: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
+
     # Parallel CPU code:
     start_time = time.time()
     strongest_paths_numba = compute_strongest_paths_numba(preferences)
@@ -317,12 +324,6 @@ if __name__ == "__main__":
         strongest_paths, strongest_paths_numba
     ), "Results differ"
 
-    # Parallel GPU code:
-    start_time = time.time()
-    strongest_paths_cuda = compute_strongest_paths_cuda(preferences)
-    elapsed_time = time.time() - start_time
-    throughput = num_candidates**3 / elapsed_time
-    print(f"CUDA: {elapsed_time:.4f} seconds, {throughput:,.2f} candidates^3/sec")
     assert (strongest_paths_numba is None) or np.array_equal(
         strongest_paths_numba, strongest_paths_cuda
     ), "Results differ"

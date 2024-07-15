@@ -58,7 +58,7 @@ class BuildExt(build_ext):
         # Ada: -arch=sm_89
         # Hopper: -arch=sm_90
         # https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
-        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -arch=sm_86 -Xcompiler -fPIC {include_dirs}"
+        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_90,code=compute_90 -Xcompiler -fPIC {include_dirs}"
         os.system(cmd)
 
 
@@ -76,11 +76,11 @@ ext_modules = [
             pybind11.get_include(),
             np.get_include(),
             get_python_inc(),
-            "/usr/local/cuda/include",
-            "/usr/include/cuda",
             "cccl/cub/",
             "cccl/libcudacxx/include",
             "cccl/thrust/",
+            "/usr/local/cuda/include/",
+            "/usr/include/cuda/",
         ],
         library_dirs=[
             "/usr/local/cuda/lib64",

@@ -10,6 +10,8 @@
     "files.associations": {
         "random": "cpp",
         "charconv": "cpp",
-        "__target_macros": "cpp"
+        "__target_macros": "cpp",
+        "barrier": "cpp",
+        "*.tcc": "cpp"
     }
 }
