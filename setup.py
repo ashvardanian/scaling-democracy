@@ -52,6 +52,7 @@ class BuildExt(build_ext):
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
         output_file = os.path.join(output_dir, "scaling_democracy.o")
 
+        # Kepler: -arch=sm_30
         # Turing: -arch=sm_75
         # Ampere: -arch=sm_86
         # Ada: -arch=sm_89

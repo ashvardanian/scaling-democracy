@@ -16,13 +16,23 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+#define SCALING_DEMOCRACY_KEPLER 1
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define SCALING_DEMOCRACY_HOPPER 1
+#endif
+
 namespace py = pybind11;
 
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
+#if defined(SCALING_DEMOCRACY_KEPLER)
+
 /**
- * @brief Processes a tile of the preferences matrix for the block-parallel Schulze voting algorithm in CUDA.
+ * @brief   Processes a tile of the preferences matrix for the block-parallel Schulze voting algorithm
+ *          in CUDA on Nvidia @b Kepler GPUs and newer (sm_30).
  *
  * @tparam tile_size The size of the tile to be processed.
  * @tparam synchronize Whether to synchronize threads within the tile processing.
@@ -40,14 +50,14 @@ using candidate_idx_t = uint32_t;
  * @param b_col Column index of the second input tile in the global matrix.
  */
 template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
-__forceinline__ __device__ void _process_tile_cuda(       //
-    votes_count_t* c, votes_count_t* a, votes_count_t* b, //
-    candidate_idx_t bi, candidate_idx_t bj,               //
-    candidate_idx_t c_row, candidate_idx_t c_col,         //
-    candidate_idx_t a_row, candidate_idx_t a_col,         //
+__forceinline__ __device__ void _process_tile_cuda(                   //
+    votes_count_t* c, votes_count_t const* a, votes_count_t const* b, //
+    candidate_idx_t bi, candidate_idx_t bj,                           //
+    candidate_idx_t c_row, candidate_idx_t c_col,                     //
+    candidate_idx_t a_row, candidate_idx_t a_col,                     //
     candidate_idx_t b_row, candidate_idx_t b_col) {
 
-#pragma unroll
+#pragma unroll(tile_size)
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
         if constexpr (may_be_diagonal) {
@@ -55,8 +65,9 @@ __forceinline__ __device__ void _process_tile_cuda(       //
             uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
             uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
             uint32_t is_bigger = smallest > c[bi * tile_size + bj];
-            if (is_not_diagonal_c + is_not_diagonal_a + is_not_diagonal_b + is_bigger == 4)
-                c[bi * tile_size + bj] = smallest;
+            uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+            // On Kepler an newer we can use `__funnelshift_lc` to avoid branches
+            c[bi * tile_size + bj] = __funnelshift_lc(c[bi * tile_size + bj], smallest, will_replace - 1);
         } else
             c[bi * tile_size + bj] = umax(c[bi * tile_size + bj], smallest);
         if constexpr (synchronize)
@@ -64,8 +75,57 @@ __forceinline__ __device__ void _process_tile_cuda(       //
     }
 }
 
+#else
+
 /**
- * @brief Performs the diagonal step of the block-parallel Schulze voting algorithm in CUDA.
+ * @brief   Processes a tile of the preferences matrix for the block-parallel Schulze voting algorithm
+ *          in CUDA or @b HIP.
+ *
+ * @tparam tile_size The size of the tile to be processed.
+ * @tparam synchronize Whether to synchronize threads within the tile processing.
+ * @tparam may_be_diagonal Whether the tile may contain diagonal elements.
+ * @param c The output tile.
+ * @param a The first input tile.
+ * @param b The second input tile.
+ * @param bi Row index within the tile.
+ * @param bj Column index within the tile.
+ * @param c_row Row index of the output tile in the global matrix.
+ * @param c_col Column index of the output tile in the global matrix.
+ * @param a_row Row index of the first input tile in the global matrix.
+ * @param a_col Column index of the first input tile in the global matrix.
+ * @param b_row Row index of the second input tile in the global matrix.
+ * @param b_col Column index of the second input tile in the global matrix.
+ */
+template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
+__forceinline__ __device__ void _process_tile_cuda(                   //
+    votes_count_t* c, votes_count_t const* a, votes_count_t const* b, //
+    candidate_idx_t bi, candidate_idx_t bj,                           //
+    candidate_idx_t c_row, candidate_idx_t c_col,                     //
+    candidate_idx_t a_row, candidate_idx_t a_col,                     //
+    candidate_idx_t b_row, candidate_idx_t b_col) {
+
+#pragma unroll(tile_size)
+    for (candidate_idx_t k = 0; k < tile_size; k++) {
+        votes_count_t smallest = min(a[bi * tile_size + k], b[k * tile_size + bj]);
+        if constexpr (may_be_diagonal) {
+            uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+            uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
+            uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
+            uint32_t is_bigger = smallest > c[bi * tile_size + bj];
+            uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+            if (will_replace)
+                c[bi * tile_size + bj] = smallest;
+        } else
+            c[bi * tile_size + bj] = max(c[bi * tile_size + bj], min(a[bi * tile_size + k], b[k * tile_size + bj]));
+        if constexpr (synchronize)
+            __syncthreads();
+    }
+}
+
+#endif
+
+/**
+ * @brief Performs the diagonal step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  * @tparam tile_size The size of the tile to be processed.
  * @param n The number of candidates.
@@ -77,7 +137,7 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
 
-    __shared__ votes_count_t c[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
     c[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
@@ -92,7 +152,7 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
 }
 
 /**
- * @brief Performs the partially independent step of the block-parallel Schulze voting algorithm in CUDA.
+ * @brief Performs the partially independent step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  * @tparam tile_size The size of the tile to be processed.
  * @param n The number of candidates.
@@ -108,9 +168,9 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
     if (i == k)
         return;
 
-    __shared__ votes_count_t a[tile_size * tile_size];
-    __shared__ votes_count_t b[tile_size * tile_size];
-    __shared__ votes_count_t c[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t a[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t b[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
 
     // Walking down within a group of adjacent columns
     c[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
@@ -124,6 +184,7 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
         k * tile_size, k * tile_size);
 
     // Walking right within a group of adjacent rows
+    __syncthreads();
     graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
     c[bi * tile_size + bj] = graph[k * tile_size * n + i * tile_size + bi * n + bj];
     a[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
@@ -140,7 +201,7 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
 }
 
 /**
- * @brief Performs then independent step of the block-parallel Schulze voting algorithm in CUDA.
+ * @brief Performs then independent step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  * @tparam tile_size The size of the tile to be processed.
  * @param n The number of candidates.
@@ -157,9 +218,9 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     if (i == k && j == k)
         return;
 
-    __shared__ votes_count_t a[tile_size * tile_size];
-    __shared__ votes_count_t b[tile_size * tile_size];
-    __shared__ votes_count_t c[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t a[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t b[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
 
     c[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
     a[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
@@ -191,7 +252,7 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
 }
 
 /**
- * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA.
+ * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  * @tparam tile_size The size of the tile to be processed.
  * @param preferences The preferences matrix.
