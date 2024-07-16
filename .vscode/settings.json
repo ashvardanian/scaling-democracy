@@ -12,6 +12,7 @@
         "charconv": "cpp",
         "__target_macros": "cpp",
         "barrier": "cpp",
-        "*.tcc": "cpp"
+        "*.tcc": "cpp",
+        "algorithm": "cpp"
     }
 }

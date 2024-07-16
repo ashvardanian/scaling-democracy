@@ -31,12 +31,12 @@ CUDA: 1.9802 seconds, 277,620,752,084.85 candidates^3/sec
 
 CUDA outperforms the baseline JIT-compiled parallel kernel by a factor of __34.55x__.
 40 core CPU uses ~270 Watts, so 10 cores use ~67.5 Watts.
-Our SXM Nvidia H100 has a ~700 Watt TDP, so 10.37x more power-hungry, meaning the CUDA implementation is 3.33x more power-efficient. 
+Our SXM Nvidia H100 has a ~700 Watt TDP, but consumes only 360 under such load, so 5x more power-hungry, meaning the CUDA implementation is 7x more power-efficient than Numba. 
 As the matrix grows, the GPU utilization improves and the experimentally observed throughput fits a sub-cubic curve:
 
-- 8 K: 2.0 s
-- 16 K: 10.5 s
-- 32 K: 51.3 s
+- 8 K: 1.9 s
+- 16 K: 9.5 s
+- 32 K: 42.9 s
 - 48 K: 105.3 s
 
 Resources:

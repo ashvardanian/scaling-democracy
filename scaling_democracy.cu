@@ -31,6 +31,8 @@ using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
+template <uint32_t tile_size> using votes_count_tile = votes_count_t[tile_size][tile_size];
+
 #if defined(SCALING_DEMOCRACY_KEPLER)
 
 /**
@@ -53,26 +55,30 @@ using candidate_idx_t = uint32_t;
  * @param b_col Column index of the second input tile in the global matrix.
  */
 template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
-__forceinline__ __device__ void _process_tile_cuda(                   //
-    votes_count_t* c, votes_count_t const* a, votes_count_t const* b, //
-    candidate_idx_t bi, candidate_idx_t bj,                           //
-    candidate_idx_t c_row, candidate_idx_t c_col,                     //
-    candidate_idx_t a_row, candidate_idx_t a_col,                     //
+__forceinline__ __device__ void _process_tile_cuda( //
+    votes_count_tile<tile_size>& c,                 //
+    votes_count_tile<tile_size> const& a,           //
+    votes_count_tile<tile_size> const& b,           //
+    candidate_idx_t bi, candidate_idx_t bj,         //
+    candidate_idx_t c_row, candidate_idx_t c_col,   //
+    candidate_idx_t a_row, candidate_idx_t a_col,   //
     candidate_idx_t b_row, candidate_idx_t b_col) {
+
+    votes_count_t& c_cell = c[bi][bj];
 
 #pragma unroll(tile_size)
     for (candidate_idx_t k = 0; k < tile_size; k++) {
-        votes_count_t smallest = umin(a[bi * tile_size + k], b[k * tile_size + bj]);
+        votes_count_t smallest = umin(a[bi][k], b[k][bj]);
         if constexpr (may_be_diagonal) {
             uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
             uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
             uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
-            uint32_t is_bigger = smallest > c[bi * tile_size + bj];
+            uint32_t is_bigger = smallest > c_cell;
             uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
             // On Kepler an newer we can use `__funnelshift_lc` to avoid branches
-            c[bi * tile_size + bj] = __funnelshift_lc(c[bi * tile_size + bj], smallest, will_replace - 1);
+            c_cell = __funnelshift_lc(c_cell, smallest, will_replace - 1);
         } else
-            c[bi * tile_size + bj] = umax(c[bi * tile_size + bj], smallest);
+            c_cell = umax(c_cell, smallest);
         if constexpr (synchronize)
             __syncthreads();
     }
@@ -100,26 +106,30 @@ __forceinline__ __device__ void _process_tile_cuda(                   //
  * @param b_col Column index of the second input tile in the global matrix.
  */
 template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
-__forceinline__ __device__ void _process_tile_cuda(                   //
-    votes_count_t* c, votes_count_t const* a, votes_count_t const* b, //
-    candidate_idx_t bi, candidate_idx_t bj,                           //
-    candidate_idx_t c_row, candidate_idx_t c_col,                     //
-    candidate_idx_t a_row, candidate_idx_t a_col,                     //
+__forceinline__ __device__ void _process_tile_cuda( //
+    votes_count_tile<tile_size>& c,                 //
+    votes_count_tile<tile_size> const& a,           //
+    votes_count_tile<tile_size> const& b,           //
+    candidate_idx_t bi, candidate_idx_t bj,         //
+    candidate_idx_t c_row, candidate_idx_t c_col,   //
+    candidate_idx_t a_row, candidate_idx_t a_col,   //
     candidate_idx_t b_row, candidate_idx_t b_col) {
+
+    votes_count_t& c_cell = c[bi][bj];
 
 #pragma unroll(tile_size)
     for (candidate_idx_t k = 0; k < tile_size; k++) {
-        votes_count_t smallest = min(a[bi * tile_size + k], b[k * tile_size + bj]);
+        votes_count_t smallest = min(a[bi][k], b[k][bj]);
         if constexpr (may_be_diagonal) {
             uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
             uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
             uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
-            uint32_t is_bigger = smallest > c[bi * tile_size + bj];
+            uint32_t is_bigger = smallest > c_cell;
             uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
             if (will_replace)
-                c[bi * tile_size + bj] = smallest;
+                c_cell = smallest;
         } else
-            c[bi * tile_size + bj] = max(c[bi * tile_size + bj], min(a[bi * tile_size + k], b[k * tile_size + bj]));
+            c_cell = max(c_cell, smallest);
         if constexpr (synchronize)
             __syncthreads();
     }
@@ -140,8 +150,8 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
 
-    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
-    c[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
+    __shared__ alignas(16) votes_count_t c[tile_size][tile_size];
+    c[bi][bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
     _process_tile_cuda<tile_size>(    //
@@ -151,7 +161,7 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
         tile_size * k, tile_size * k  //
     );
 
-    graph[k * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
+    graph[k * tile_size * n + k * tile_size + bi * n + bj] = c[bi][bj];
 }
 
 /**
@@ -171,13 +181,13 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
     if (i == k)
         return;
 
-    __shared__ alignas(16) votes_count_t a[tile_size * tile_size];
-    __shared__ alignas(16) votes_count_t b[tile_size * tile_size];
-    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_tile<tile_size> a;
+    __shared__ alignas(16) votes_count_tile<tile_size> b;
+    __shared__ alignas(16) votes_count_tile<tile_size> c;
 
     // Walking down within a group of adjacent columns
-    c[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
-    b[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
+    c[bi][bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
+    b[bi][bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
     _process_tile_cuda<tile_size>(    //
@@ -188,9 +198,9 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
 
     // Walking right within a group of adjacent rows
     __syncthreads();
-    graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi * tile_size + bj];
-    c[bi * tile_size + bj] = graph[k * tile_size * n + i * tile_size + bi * n + bj];
-    a[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
+    graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi][bj];
+    c[bi][bj] = graph[k * tile_size * n + i * tile_size + bi * n + bj];
+    a[bi][bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
 
     __syncthreads();
     _process_tile_cuda<tile_size>(    //
@@ -200,7 +210,7 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
         k * tile_size, i * tile_size  //
     );
 
-    graph[k * tile_size * n + i * tile_size + bi * n + bj] = c[bi * tile_size + bj];
+    graph[k * tile_size * n + i * tile_size + bi * n + bj] = c[bi][bj];
 }
 
 /**
@@ -221,13 +231,13 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
     if (i == k && j == k)
         return;
 
-    __shared__ alignas(16) votes_count_t a[tile_size * tile_size];
-    __shared__ alignas(16) votes_count_t b[tile_size * tile_size];
-    __shared__ alignas(16) votes_count_t c[tile_size * tile_size];
+    __shared__ alignas(16) votes_count_tile<tile_size> a;
+    __shared__ alignas(16) votes_count_tile<tile_size> b;
+    __shared__ alignas(16) votes_count_tile<tile_size> c;
 
-    c[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
-    a[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
-    b[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
+    c[bi][bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj];
+    a[bi][bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
+    b[bi][bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj];
 
     __syncthreads();
     if (i == j)
@@ -251,7 +261,7 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
             k * tile_size, j * tile_size             //
         );
 
-    graph[i * tile_size * n + j * tile_size + bi * n + bj] = c[bi * tile_size + bj];
+    graph[i * tile_size * n + j * tile_size + bi * n + bj] = c[bi][bj];
 }
 
 /**
@@ -275,9 +285,9 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
     if (i == k && j == k)
         return;
 
-    __shared__ alignas(128) votes_count_t a[tile_size][tile_size];
-    __shared__ alignas(128) votes_count_t b[tile_size][tile_size];
-    __shared__ alignas(128) votes_count_t c[tile_size][tile_size];
+    __shared__ alignas(128) votes_count_tile<tile_size> a;
+    __shared__ alignas(128) votes_count_tile<tile_size> b;
+    __shared__ alignas(128) votes_count_tile<tile_size> c;
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
     // Initialize shared memory barrier with the number of threads participating in the barrier.
@@ -288,7 +298,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         // Make initialized barrier visible in async proxy.
         cde::fence_proxy_async_shared_cta();
     }
-    // Syncthreads so initialized barrier is visible to all threads.
+    // Sync threads so initialized barrier is visible to all threads.
     __syncthreads();
 
     // Only the first thread in the tile invokes the bulk transfers.
@@ -317,7 +327,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         // We don't need to "synchronize", because A, C, and B tile arguments
         // are different in the independent state and will address different shared buffers.
         _process_tile_cuda<tile_size, false, true>( //
-            &c[0][0], &a[0][0], &b[0][0], bi, bj,   //
+            c, a, b, bi, bj,                        //
             i * tile_size, j * tile_size,           //
             i * tile_size, k * tile_size,           //
             k * tile_size, j * tile_size            //
@@ -328,7 +338,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         // We also mark as "non diagonal", because the `i != j`, and in that case
         // we can avoid some branches.
         _process_tile_cuda<tile_size, false, false>( //
-            &c[0][0], &a[0][0], &b[0][0], bi, bj,    //
+            c, a, b, bi, bj,                         //
             i * tile_size, j * tile_size,            //
             i * tile_size, k * tile_size,            //
             k * tile_size, j * tile_size             //
@@ -351,7 +361,9 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         // Destroy barrier. This invalidates the memory region of the barrier. If
         // further computations were to take place in the kernel, this allows the
         // memory location of the shared memory barrier to be reused.
-        (&bar)->~barrier();
+        // But as we are at the end, we know it will be destroyed anyways :)
+        //
+        //      bar.~barrier();
     }
 #else
     // This is a trap :)
@@ -394,7 +406,7 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
 template <uint32_t tile_size>      //
 void compute_strongest_paths_cuda( //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride,
-    votes_count_t* strongest_paths) {
+    votes_count_t* strongest_paths, bool allow_tma) {
 
 #pragma omp parallel for collapse(2)
     for (candidate_idx_t i = 0; i < num_candidates; i++)
@@ -461,7 +473,7 @@ void compute_strongest_paths_cuda( //
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
         _step_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
         _step_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
-        if (supports_tma)
+        if (supports_tma && allow_tma)
             _step_independent_hopper<tile_size>
                 <<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths_tensor_map);
         else
@@ -477,9 +489,13 @@ void compute_strongest_paths_cuda( //
  * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm.
  *
  * @param preferences The preferences matrix.
+ * @param allow_tma Whether to use Tensor Memory Access (TMA) for the computation.
  * @return A NumPy array containing the strongest paths matrix.
  */
-static py::array_t<votes_count_t> compute_strongest_paths(py::array_t<votes_count_t, py::array::c_style> preferences) {
+static py::array_t<votes_count_t> compute_strongest_paths(      //
+    py::array_t<votes_count_t, py::array::c_style> preferences, //
+    bool allow_tma) {
+
     auto buf = preferences.request();
     if (buf.ndim != 2)
         throw std::runtime_error("Number of dimensions must be two");
@@ -496,7 +512,7 @@ static py::array_t<votes_count_t> compute_strongest_paths(py::array_t<votes_coun
         throw std::runtime_error("Failed to allocate memory on device");
 
     cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
-    compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr);
+    compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
 
     // Synchronize to ensure all CUDA operations are complete
     error = cudaDeviceSynchronize();
@@ -563,5 +579,5 @@ PYBIND11_MODULE(scaling_democracy, m) {
         return thrust::reduce(thrust::device, d_data.begin(), d_data.end(), 0.0f);
     });
 
-    m.def("compute_strongest_paths", &compute_strongest_paths);
+    m.def("compute_strongest_paths", &compute_strongest_paths, py::arg("preferences"), py::arg("allow_tma") = false);
 }
