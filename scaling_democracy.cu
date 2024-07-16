@@ -294,7 +294,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
     __shared__ barrier_t bar;
     if (bj == 0 && bi == 0) {
         // We have one thread per tile cell.
-        init(&bar, tile_size * tile_size);
+        init(&bar, 1);
         // Make initialized barrier visible in async proxy.
         cde::fence_proxy_async_shared_cta();
     }
@@ -312,7 +312,9 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(c) + sizeof(a) + sizeof(b));
     } else {
         // Other threads just arrive.
-        token = bar.arrive(1);
+        // But we don't really need this!
+        //
+        //      token = bar.arrive(1);
     }
 
     // Wait for the data to have arrived.
