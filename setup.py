@@ -89,7 +89,9 @@ ext_modules = [
             python_lib_dir,
         ],
         libraries=[
+            "cudart",
             "cuda",
+            "cublas",
             python_lib_name.replace(".a", ""),
         ],
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"],

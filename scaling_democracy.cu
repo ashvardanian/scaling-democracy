@@ -468,22 +468,31 @@ void compute_strongest_paths_cuda( //
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
         // Any element that is outside of bounds will be set to zero by the TMA transfer.
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (res != CUDA_SUCCESS)
+        throw std::runtime_error("Failed to create tensor map");
 
     candidate_idx_t tiles_count = (num_candidates + tile_size - 1) / tile_size;
     dim3 tile_shape(tile_size, tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
         _step_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
+        error = cudaDeviceSynchronize();
+        if (error != cudaSuccess)
+            throw std::runtime_error(std::string("Diagonal phase: ") + cudaGetErrorString(error));
+
         _step_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
+        error = cudaDeviceSynchronize();
+        if (error != cudaSuccess)
+            throw std::runtime_error(std::string("Partially independent phase: ") + cudaGetErrorString(error));
+
         if (supports_tma && allow_tma)
             _step_independent_hopper<tile_size>
                 <<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths_tensor_map);
         else
             _step_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
-
-        error = cudaGetLastError();
+        error = cudaDeviceSynchronize();
         if (error != cudaSuccess)
-            throw std::runtime_error(cudaGetErrorString(error));
+            throw std::runtime_error(std::string("Independent phase: ") + cudaGetErrorString(error));
     }
 }
 
