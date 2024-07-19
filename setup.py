@@ -92,9 +92,13 @@ ext_modules = [
             "cudart",
             "cuda",
             "cublas",
+            "gomp",  # OpenMP
             python_lib_name.replace(".a", ""),
         ],
-        extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"],
+        extra_link_args=[
+            f"-Wl,-rpath,{python_lib_dir}",
+            "-fopenmp",
+        ],
         language="c++",
     ),
 ]

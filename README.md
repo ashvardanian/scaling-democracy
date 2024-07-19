@@ -12,7 +12,7 @@ cd scaling-democracy
 git submodule update --init --recursive
 pip install pybind11 numpy numba cupy-cuda12x
 pip install -e .
-python benchmark.py
+python benchmark.py --num-candidates 4096 --num-voters 64 --run-openmp --run-numba --run-serial
 ```
 
 It's a fun project by itself. It might be a good example of using GPUs for combinatorial problems with order-dependant traversal and also a good starting point for single-day CUDA hacking experiences with the header-only [CCCL](https://github.com/NVIDIA/cccl), containing Thrust, CUB, and `libcudacxx`.

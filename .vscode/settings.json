@@ -1,8 +1,10 @@
 {
     "cSpell.words": [
+        "CUDA",
         "dtype",
         "ndarray",
         "numba",
+        "openmp",
         "prange",
         "schulze",
         "Warshall"

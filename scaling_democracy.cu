@@ -3,6 +3,7 @@
  * @author Ash Vardanian
  * @date   July 12, 2024
  */
+#include <csignal> // `std::signal`
 #include <cstdint>
 
 #include <cuda_runtime.h>
@@ -12,6 +13,9 @@
 #include <cudaTypedefs.h> // `PFN_cuTensorMapEncodeTiled`
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
+
+#include <omp.h>  // `omp_set_num_threads`
+#include <thread> // `std::thread::hardware_concurrency()`
 
 #include <pybind11/numpy.h> // `array_t`
 #include <pybind11/pybind11.h>
@@ -32,6 +36,13 @@ using votes_count_t = uint32_t;
 using candidate_idx_t = uint32_t;
 
 template <uint32_t tile_size> using votes_count_tile = votes_count_t[tile_size][tile_size];
+
+/**
+ * @brief   Stores the interrupt signal status.
+ */
+volatile std::sig_atomic_t global_signal_status = 0;
+
+void signal_handler(int signal) { global_signal_status = signal; }
 
 #if defined(SCALING_DEMOCRACY_KEPLER)
 
@@ -146,7 +157,7 @@ __forceinline__ __device__ void _process_tile_cuda( //
  * @param graph The graph of strongest paths.
  */
 template <uint32_t tile_size>
-__global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+__global__ void _cuda_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
 
@@ -173,7 +184,7 @@ __global__ void _step_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
  * @param graph The graph of strongest paths.
  */
 template <uint32_t tile_size>
-__global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+__global__ void _cuda_partially_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const i = blockIdx.x;
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
@@ -222,7 +233,7 @@ __global__ void _step_partially_independent(candidate_idx_t n, candidate_idx_t k
  * @param graph The graph of strongest paths.
  */
 template <uint32_t tile_size>
-__global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
+__global__ void _cuda_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const j = blockIdx.x;
     candidate_idx_t const i = blockIdx.y;
     candidate_idx_t const bi = threadIdx.y;
@@ -273,7 +284,7 @@ __global__ void _step_independent(candidate_idx_t n, candidate_idx_t k, votes_co
  * @param graph The graph of strongest paths represented as a `CUtensorMap`.
  */
 template <uint32_t tile_size>
-__global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
+__global__ void _cuda_independent_hopper(candidate_idx_t n, candidate_idx_t k,
                                          __grid_constant__ CUtensorMap const graph) {
     candidate_idx_t const j = blockIdx.x;
     candidate_idx_t const i = blockIdx.y;
@@ -292,9 +303,9 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
 #pragma nv_diag_suppress static_var_with_dynamic_init
     // Initialize shared memory barrier with the number of threads participating in the barrier.
     __shared__ barrier_t bar;
-    if (bj == 0 && bi == 0) {
+    if (threadIdx.x == 0) {
         // We have one thread per tile cell.
-        init(&bar, 1);
+        init(&bar, tile_size * tile_size);
         // Make initialized barrier visible in async proxy.
         cde::fence_proxy_async_shared_cta();
     }
@@ -303,7 +314,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
 
     // Only the first thread in the tile invokes the bulk transfers.
     barrier_t::arrival_token token;
-    if (bj == 0 && bi == 0) {
+    if (threadIdx.x == 0) {
         // Initiate three bulk tensor copies for different part of the graph.
         cde::cp_async_bulk_tensor_2d_global_to_shared(&c, &graph, i * tile_size, j * tile_size, bar);
         cde::cp_async_bulk_tensor_2d_global_to_shared(&a, &graph, i * tile_size, k * tile_size, bar);
@@ -312,9 +323,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
         token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(c) + sizeof(a) + sizeof(b));
     } else {
         // Other threads just arrive.
-        // But we don't really need this!
-        //
-        //      token = bar.arrive(1);
+        token = bar.arrive(1);
     }
 
     // Wait for the data to have arrived.
@@ -352,7 +361,7 @@ __global__ void _step_independent_hopper(candidate_idx_t n, candidate_idx_t k,
     // After syncthreads, writes by all threads are visible to TMA engine.
 
     // Initiate TMA transfer to copy shared memory to global memory
-    if (bj == 0 && bi == 0) {
+    if (threadIdx.x == 0) {
         cde::cp_async_bulk_tensor_2d_shared_to_global(&graph, i * tile_size, j * tile_size, &c);
         // Wait for TMA transfer to have finished reading shared memory.
         // Create a "bulk async-group" out of the previous bulk copy operation.
@@ -403,21 +412,20 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
  * @param preferences The preferences matrix.
  * @param num_candidates The number of candidates.
  * @param row_stride The stride between rows in the preferences matrix.
- * @param strongest_paths The output matrix of strongest paths.
+ * @param graph The output matrix of strongest paths.
  */
 template <uint32_t tile_size>      //
 void compute_strongest_paths_cuda( //
-    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride,
-    votes_count_t* strongest_paths, bool allow_tma) {
+    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph,
+    bool allow_tma) {
 
 #pragma omp parallel for collapse(2)
     for (candidate_idx_t i = 0; i < num_candidates; i++)
         for (candidate_idx_t j = 0; j < num_candidates; j++)
             if (i != j)
-                strongest_paths[i * num_candidates + j] =
-                    preferences[i * row_stride + j] > preferences[j * row_stride + i] //
-                        ? preferences[i * row_stride + j]
-                        : 0;
+                graph[i * num_candidates + j] = preferences[i * row_stride + j] > preferences[j * row_stride + i] //
+                                                    ? preferences[i * row_stride + j]
+                                                    : 0;
 
     // Check if we can use newer CUDA features.
     cudaError_t error;
@@ -430,7 +438,6 @@ void compute_strongest_paths_cuda( //
     if (error != cudaSuccess)
         throw std::runtime_error("Failed to get device properties");
     bool supports_tma = device_props.major >= 9;
-    printf("Device %d supports TMA: %s\n", current_device, supports_tma ? "yes" : "no");
 
     CUtensorMap strongest_paths_tensor_map{};
     // rank is the number of dimensions of the array.
@@ -452,12 +459,12 @@ void compute_strongest_paths_cuda( //
     CUresult res = cuTensorMapEncodeTiled( //
         &strongest_paths_tensor_map,       // CUtensorMap *tensorMap,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-        rank,            // cuuint32_t tensorRank,
-        strongest_paths, // void *globalAddress,
-        size,            // const cuuint64_t *globalDim,
-        stride,          // const cuuint64_t *globalStrides,
-        box_size,        // const cuuint32_t *boxDim,
-        elem_stride,     // const cuuint32_t *elementStrides,
+        rank,        // cuuint32_t tensorRank,
+        graph,       // void *globalAddress,
+        size,        // const cuuint64_t *globalDim,
+        stride,      // const cuuint64_t *globalStrides,
+        box_size,    // const cuuint32_t *boxDim,
+        elem_stride, // const cuuint32_t *elementStrides,
         // Interleave patterns can be used to accelerate loading of values that
         // are less than 4 bytes long.
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -468,31 +475,181 @@ void compute_strongest_paths_cuda( //
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
         // Any element that is outside of bounds will be set to zero by the TMA transfer.
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    if (res != CUDA_SUCCESS)
-        throw std::runtime_error("Failed to create tensor map");
 
     candidate_idx_t tiles_count = (num_candidates + tile_size - 1) / tile_size;
     dim3 tile_shape(tile_size, tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
-        _step_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, strongest_paths);
-        error = cudaDeviceSynchronize();
-        if (error != cudaSuccess)
-            throw std::runtime_error(std::string("Diagonal phase: ") + cudaGetErrorString(error));
-
-        _step_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, strongest_paths);
-        error = cudaDeviceSynchronize();
-        if (error != cudaSuccess)
-            throw std::runtime_error(std::string("Partially independent phase: ") + cudaGetErrorString(error));
-
+        _cuda_diagonal<tile_size><<<1, tile_shape>>>(num_candidates, k, graph);
+        _cuda_partially_independent<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, graph);
         if (supports_tma && allow_tma)
-            _step_independent_hopper<tile_size>
+            _cuda_independent_hopper<tile_size>
                 <<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths_tensor_map);
         else
-            _step_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths);
-        error = cudaDeviceSynchronize();
+            _cuda_independent<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, graph);
+
+        error = cudaGetLastError();
         if (error != cudaSuccess)
-            throw std::runtime_error(std::string("Independent phase: ") + cudaGetErrorString(error));
+            throw std::runtime_error(cudaGetErrorString(error));
+    }
+}
+
+/**
+ * @brief   Processes a tile of the preferences matrix for the block-parallel Schulze
+ *          voting algorithm on CPU using @b OpenMP.
+ *
+ * @tparam tile_size The size of the tile to be processed.
+ * @tparam synchronize Whether to synchronize threads within the tile processing.
+ * @tparam may_be_diagonal Whether the tile may contain diagonal elements.
+ * @param c The output tile.
+ * @param a The first input tile.
+ * @param b The second input tile.
+ * @param bi Row index within the tile.
+ * @param bj Column index within the tile.
+ * @param c_row Row index of the output tile in the global matrix.
+ * @param c_col Column index of the output tile in the global matrix.
+ * @param a_row Row index of the first input tile in the global matrix.
+ * @param a_col Column index of the first input tile in the global matrix.
+ * @param b_row Row index of the second input tile in the global matrix.
+ * @param b_col Column index of the second input tile in the global matrix.
+ */
+template <uint32_t tile_size, bool may_be_diagonal = true>
+inline void _process_tile_openmp(                 //
+    votes_count_tile<tile_size>& c,               //
+    votes_count_tile<tile_size> const& a,         //
+    votes_count_tile<tile_size> const& b,         //
+    candidate_idx_t c_row, candidate_idx_t c_col, //
+    candidate_idx_t a_row, candidate_idx_t a_col, //
+    candidate_idx_t b_row, candidate_idx_t b_col) {
+
+    for (candidate_idx_t k = 0; k < tile_size; k++) {
+        for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
+            for (candidate_idx_t bj = 0; bj < tile_size; bj++) {
+                votes_count_t& c_cell = c[bi][bj];
+                votes_count_t smallest = std::min(a[bi][k], b[k][bj]);
+                if constexpr (may_be_diagonal) {
+                    uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+                    uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
+                    uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
+                    uint32_t is_bigger = smallest > c_cell;
+                    uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+                    if (will_replace)
+                        c_cell = smallest;
+                } else
+                    c_cell = std::max(c_cell, smallest);
+            }
+        }
+    }
+}
+
+template <uint32_t tile_size>
+void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_tile<tile_size>& target) {
+    for (candidate_idx_t i = 0; i < tile_size; i++)
+        for (candidate_idx_t j = 0; j < tile_size; j++)
+            target[i][j] = source[i * stride + j];
+}
+
+template <uint32_t tile_size>
+void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride, votes_count_t* target) {
+    for (candidate_idx_t i = 0; i < tile_size; i++)
+        for (candidate_idx_t j = 0; j < tile_size; j++)
+            target[i * stride + j] = source[i][j];
+}
+
+template <uint32_t tile_size>        //
+void compute_strongest_paths_openmp( //
+    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph) {
+
+#pragma omp parallel for
+    for (candidate_idx_t i = 0; i < num_candidates; i++)
+        for (candidate_idx_t j = 0; j < num_candidates; j++)
+            if (i != j)
+                graph[i * num_candidates + j] =                                       //
+                    preferences[i * row_stride + j] > preferences[j * row_stride + i] //
+                        ? preferences[i * row_stride + j]
+                        : 0;
+
+    // Time for the actual core implementation
+    candidate_idx_t const tiles_count = (num_candidates + tile_size - 1) / tile_size;
+    for (candidate_idx_t k = 0; k < tiles_count; k++) {
+
+        if (global_signal_status != 0)
+            throw std::runtime_error("Stopped by signal");
+
+        // Dependent phase
+        {
+            alignas(64) votes_count_t c[tile_size][tile_size];
+            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, c);
+            _process_tile_openmp<tile_size>(  //
+                c, c, c,                      //
+                tile_size * k, tile_size * k, //
+                tile_size * k, tile_size * k, //
+                tile_size * k, tile_size * k  //
+            );
+            memcpy2d<tile_size>(c, num_candidates, graph + k * tile_size * num_candidates + k * tile_size);
+        }
+        // Partially independent phase (first of two)
+#pragma omp parallel for
+        for (candidate_idx_t i = 0; i < tiles_count; i++) {
+            if (i == k)
+                continue;
+            alignas(64) votes_count_tile<tile_size> b;
+            alignas(64) votes_count_tile<tile_size> c;
+            memcpy2d<tile_size>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates, c);
+            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, b);
+            _process_tile_openmp<tile_size>(  //
+                c, c, b,                      //
+                i * tile_size, k * tile_size, //
+                i * tile_size, k * tile_size, //
+                k * tile_size, k * tile_size);
+            memcpy2d<tile_size>(c, num_candidates, graph + i * tile_size * num_candidates + k * tile_size);
+        }
+        // Partially independent phase (second of two)
+#pragma omp parallel for
+        for (candidate_idx_t i = 0; i < tiles_count; i++) {
+            if (i == k)
+                continue;
+            alignas(64) votes_count_tile<tile_size> a;
+            alignas(64) votes_count_tile<tile_size> c;
+            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + i * tile_size, num_candidates, c);
+            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, a);
+            _process_tile_openmp<tile_size>(  //
+                c, a, c,                      //
+                k * tile_size, i * tile_size, //
+                k * tile_size, k * tile_size, //
+                k * tile_size, i * tile_size  //
+            );
+            memcpy2d<tile_size>(c, num_candidates, graph + k * tile_size * num_candidates + i * tile_size);
+        }
+        // Independent phase
+#pragma omp parallel for
+        for (candidate_idx_t i = 0; i < tiles_count; i++) {
+            for (candidate_idx_t j = 0; j < tiles_count; j++) {
+                if (i == k && j == k)
+                    continue;
+                alignas(64) votes_count_tile<tile_size> a;
+                alignas(64) votes_count_tile<tile_size> b;
+                alignas(64) votes_count_tile<tile_size> c;
+                memcpy2d<tile_size>(graph + i * tile_size * num_candidates + j * tile_size, num_candidates, c);
+                memcpy2d<tile_size>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates, a);
+                memcpy2d<tile_size>(graph + k * tile_size * num_candidates + j * tile_size, num_candidates, b);
+                if (i == j)
+                    _process_tile_openmp<tile_size, true>( //
+                        c, a, b,                           //
+                        i * tile_size, j * tile_size,      //
+                        i * tile_size, k * tile_size,      //
+                        k * tile_size, j * tile_size       //
+                    );
+                else
+                    _process_tile_openmp<tile_size, false>( //
+                        c, a, b,                            //
+                        i * tile_size, j * tile_size,       //
+                        i * tile_size, k * tile_size,       //
+                        k * tile_size, j * tile_size        //
+                    );
+                memcpy2d<tile_size>(c, num_candidates, graph + i * tile_size * num_candidates + j * tile_size);
+            }
+        }
     }
 }
 
@@ -505,7 +662,7 @@ void compute_strongest_paths_cuda( //
  */
 static py::array_t<votes_count_t> compute_strongest_paths(      //
     py::array_t<votes_count_t, py::array::c_style> preferences, //
-    bool allow_tma) {
+    bool allow_tma, bool allow_gpu) {
 
     auto buf = preferences.request();
     if (buf.ndim != 2)
@@ -516,51 +673,59 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     auto num_candidates = static_cast<candidate_idx_t>(buf.shape[0]);
     auto row_stride = static_cast<candidate_idx_t>(buf.strides[0] / sizeof(votes_count_t));
 
-    votes_count_t* strongest_paths_ptr = nullptr;
-    cudaError_t error;
-    error = cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
-    if (error != cudaSuccess)
-        throw std::runtime_error("Failed to allocate memory on device");
-
-    cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
-    compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
-
-    // Synchronize to ensure all CUDA operations are complete
-    error = cudaDeviceSynchronize();
-    if (error != cudaSuccess) {
-        cudaFree(strongest_paths_ptr);
-        throw std::runtime_error("CUDA operations did not complete successfully");
-    }
-
     // Allocate NumPy array for the result
     auto result = py::array_t<votes_count_t>({num_candidates, num_candidates});
     auto result_buf = result.request();
     auto result_ptr = reinterpret_cast<votes_count_t*>(result_buf.ptr);
 
-    // Copy data from the GPU to the NumPy array
-    error = cudaMemcpy(result_ptr, strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t),
-                       cudaMemcpyDeviceToHost);
-    if (error != cudaSuccess) {
-        cudaFree(strongest_paths_ptr);
-        throw std::runtime_error("Failed to copy data from device to host");
-    }
+    if (!allow_gpu) {
+        omp_set_dynamic(0); // Explicitly disable dynamic teams
+        omp_set_num_threads(std::thread::hardware_concurrency());
+        compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    } else {
+        votes_count_t* strongest_paths_ptr = nullptr;
+        cudaError_t error;
+        error = cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
+        if (error != cudaSuccess)
+            throw std::runtime_error("Failed to allocate memory on device");
 
-    // Synchronize to ensure all CUDA transfers are complete
-    error = cudaDeviceSynchronize();
-    if (error != cudaSuccess) {
-        cudaFree(strongest_paths_ptr);
-        throw std::runtime_error("CUDA transfers did not complete successfully");
-    }
+        cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
+        compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
 
-    // Free the GPU memory
-    error = cudaFree(strongest_paths_ptr);
-    if (error != cudaSuccess)
-        throw std::runtime_error("Failed to free memory on device");
+        // Synchronize to ensure all CUDA operations are complete
+        error = cudaDeviceSynchronize();
+        if (error != cudaSuccess) {
+            cudaFree(strongest_paths_ptr);
+            throw std::runtime_error("CUDA operations did not complete successfully");
+        }
+
+        // Copy data from the GPU to the NumPy array
+        error = cudaMemcpy(result_ptr, strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t),
+                           cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) {
+            cudaFree(strongest_paths_ptr);
+            throw std::runtime_error("Failed to copy data from device to host");
+        }
+
+        // Synchronize to ensure all CUDA transfers are complete
+        error = cudaDeviceSynchronize();
+        if (error != cudaSuccess) {
+            cudaFree(strongest_paths_ptr);
+            throw std::runtime_error("CUDA transfers did not complete successfully");
+        }
+
+        // Free the GPU memory
+        error = cudaFree(strongest_paths_ptr);
+        if (error != cudaSuccess)
+            throw std::runtime_error("Failed to free memory on device");
+    }
 
     return result;
 }
 
 PYBIND11_MODULE(scaling_democracy, m) {
+
+    std::signal(SIGINT, signal_handler);
 
     // Let's show how to wrap `void` functions for basic logging
     m.def("log_devices", []() {
@@ -590,5 +755,8 @@ PYBIND11_MODULE(scaling_democracy, m) {
         return thrust::reduce(thrust::device, d_data.begin(), d_data.end(), 0.0f);
     });
 
-    m.def("compute_strongest_paths", &compute_strongest_paths, py::arg("preferences"), py::arg("allow_tma") = false);
+    m.def("compute_strongest_paths", &compute_strongest_paths, //
+          py::arg("preferences"), py::kw_only(),               //
+          py::arg("allow_tma") = false,                        //
+          py::arg("allow_gpu") = false);
 }
