@@ -9,6 +9,10 @@
 
 #include <omp.h> // `omp_set_num_threads`
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #if defined(__NVCC__)
 #include <cuda.h> // `CUtensorMap`
 #include <cuda/barrier>
@@ -528,6 +532,43 @@ inline void _process_tile_openmp(                 //
     candidate_idx_t a_row, candidate_idx_t a_col, //
     candidate_idx_t b_row, candidate_idx_t b_col) {
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+        uint32x4_t bj_step = {0, 1, 2, 3};
+        for (candidate_idx_t k = 0; k < tile_size; k++) {
+            for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
+                uint32x4_t is_not_diagonal_a = vdupq_n_u32((a_row + bi) != (a_col + k));
+                for (candidate_idx_t bj = 0; bj < tile_size; bj += 4) {
+                    votes_count_t* c_ptr = &c[bi][bj];
+                    uint32x4_t c_val = vld1q_u32(c_ptr);
+                    uint32x4_t a_val = vdupq_n_u32(a[bi][k]);
+                    uint32x4_t b_val = vld1q_u32(&b[k][bj]);
+                    uint32x4_t smallest = vminq_u32(a_val, b_val);
+
+                    if constexpr (may_be_diagonal) {
+                        uint32x4_t is_diagonal_c =             //
+                            vceqq_u32(vdupq_n_u32(c_row + bi), //
+                                      vaddq_u32(vdupq_n_u32(c_col + bj), bj_step));
+                        uint32x4_t is_diagonal_b =            //
+                            vceqq_u32(vdupq_n_u32(b_row + k), //
+                                      vaddq_u32(vdupq_n_u32(b_col + bj), bj_step));
+                        uint32x4_t is_bigger = vcgtq_u32(smallest, c_val);
+                        uint32x4_t will_replace =                                   //
+                            vandq_u32(                                              //
+                                vmvnq_u32(vorrq_u32(is_diagonal_c, is_diagonal_b)), //
+                                vandq_u32(is_not_diagonal_a, is_bigger));
+                        c_val = vbslq_u32(will_replace, smallest, c_val);
+                    } else {
+                        c_val = vmaxq_u32(c_val, smallest);
+                    }
+                    vst1q_u32(c_ptr, c_val);
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
             for (candidate_idx_t bj = 0; bj < tile_size; bj++) {
@@ -541,8 +582,9 @@ inline void _process_tile_openmp(                 //
                     std::uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
                     if (will_replace)
                         c_cell = smallest;
-                } else
+                } else {
                     c_cell = std::max(c_cell, smallest);
+                }
             }
         }
     }
@@ -550,6 +592,19 @@ inline void _process_tile_openmp(                 //
 
 template <std::uint32_t tile_size>
 void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_tile<tile_size>& target) {
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+        for (candidate_idx_t i = 0; i < tile_size; i++) {
+#pragma unroll full
+            for (candidate_idx_t j = 0; j < tile_size; j += 4) {
+                vst1q_u32(&target[i][j], vld1q_u32(&source[i * stride + j]));
+            }
+        }
+        return;
+    }
+#endif
+
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
             target[i][j] = source[i * stride + j];
@@ -557,6 +612,19 @@ void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_t
 
 template <std::uint32_t tile_size>
 void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride, votes_count_t* target) {
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+        for (candidate_idx_t i = 0; i < tile_size; i++) {
+#pragma unroll full
+            for (candidate_idx_t j = 0; j < tile_size; j += 4) {
+                vst1q_u32(&target[i * stride + j], vld1q_u32(&source[i][j]));
+            }
+        }
+        return;
+    }
+#endif
+
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
             target[i * stride + j] = source[i][j];
@@ -668,7 +736,7 @@ void compute_strongest_paths_openmp( //
  */
 static py::array_t<votes_count_t> compute_strongest_paths(      //
     py::array_t<votes_count_t, py::array::c_style> preferences, //
-    bool allow_tma, bool allow_gpu) {
+    bool allow_tma, bool allow_gpu, std::size_t tile_size = 0) {
 
     auto buf = preferences.request();
     if (buf.ndim != 2)
@@ -728,7 +796,18 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
 
     omp_set_dynamic(0); // Explicitly disable dynamic teams
     omp_set_num_threads(std::thread::hardware_concurrency());
-    compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    if (tile_size == 0)
+        compute_strongest_paths_openmp<64>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    else if (tile_size == 16)
+        compute_strongest_paths_openmp<16>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    else if (tile_size == 32)
+        compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    else if (tile_size == 64)
+        compute_strongest_paths_openmp<64>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    else if (tile_size == 128)
+        compute_strongest_paths_openmp<128>(preferences_ptr, num_candidates, row_stride, result_ptr);
+    else
+        throw std::runtime_error("Unsupported tile size");
     return result;
 }
 
@@ -775,5 +854,6 @@ PYBIND11_MODULE(scaling_democracy, m) {
     m.def("compute_strongest_paths", &compute_strongest_paths, //
           py::arg("preferences"), py::kw_only(),               //
           py::arg("allow_tma") = false,                        //
-          py::arg("allow_gpu") = false);
+          py::arg("allow_gpu") = false,                        //
+          py::arg("tile_size") = 0);
 }
