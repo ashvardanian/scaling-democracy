@@ -4,7 +4,7 @@ from typing import Sequence, Tuple, List
 import numpy as np
 from numba import njit, prange, get_num_threads
 
-from scaling_democracy import log_devices
+from scaling_democracy import log_gpus
 from scaling_democracy import compute_strongest_paths
 
 
@@ -333,7 +333,7 @@ if __name__ == "__main__":
     )
 
     # Generate random voter rankings
-    log_devices()
+    log_gpus()
     print(
         f"Generating {num_voters:,} random voter rankings with {num_candidates:,} candidates"
     )

@@ -4,18 +4,19 @@
  * @date   July 12, 2024
  */
 #include <csignal> // `std::signal`
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
+#include <thread>  // `std::thread::hardware_concurrency()`
 
-#include <cuda_runtime.h>
+#include <omp.h> // `omp_set_num_threads`
 
+#if defined(__NVCC__)
 #include <cuda.h> // `CUtensorMap`
 #include <cuda/barrier>
 #include <cudaTypedefs.h> // `PFN_cuTensorMapEncodeTiled`
+#include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
-
-#include <omp.h>  // `omp_set_num_threads`
-#include <thread> // `std::thread::hardware_concurrency()`
+#endif
 
 #include <pybind11/numpy.h> // `array_t`
 #include <pybind11/pybind11.h>
@@ -29,13 +30,11 @@
 #endif
 
 namespace py = pybind11;
-namespace cde = cuda::device::experimental;
-using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
-using votes_count_t = uint32_t;
-using candidate_idx_t = uint32_t;
+using votes_count_t = std::uint32_t;
+using candidate_idx_t = std::uint32_t;
 
-template <uint32_t tile_size> using votes_count_tile = votes_count_t[tile_size][tile_size];
+template <std::uint32_t tile_size> using votes_count_tile = votes_count_t[tile_size][tile_size];
 
 /**
  * @brief   Stores the interrupt signal status.
@@ -43,6 +42,11 @@ template <uint32_t tile_size> using votes_count_tile = votes_count_t[tile_size][
 volatile std::sig_atomic_t global_signal_status = 0;
 
 void signal_handler(int signal) { global_signal_status = signal; }
+
+#if defined(__NVCC__)
+
+namespace cde = cuda::device::experimental;
+using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
 #if defined(SCALING_DEMOCRACY_KEPLER)
 
@@ -65,7 +69,7 @@ void signal_handler(int signal) { global_signal_status = signal; }
  * @param b_row Row index of the second input tile in the global matrix.
  * @param b_col Column index of the second input tile in the global matrix.
  */
-template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
+template <std::uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
 __forceinline__ __device__ void _process_tile_cuda( //
     votes_count_tile<tile_size>& c,                 //
     votes_count_tile<tile_size> const& a,           //
@@ -81,11 +85,11 @@ __forceinline__ __device__ void _process_tile_cuda( //
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = umin(a[bi][k], b[k][bj]);
         if constexpr (may_be_diagonal) {
-            uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
-            uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
-            uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
-            uint32_t is_bigger = smallest > c_cell;
-            uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+            std::uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+            std::uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
+            std::uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
+            std::uint32_t is_bigger = smallest > c_cell;
+            std::uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
             // On Kepler an newer we can use `__funnelshift_lc` to avoid branches
             c_cell = __funnelshift_lc(c_cell, smallest, will_replace - 1);
         } else
@@ -116,7 +120,7 @@ __forceinline__ __device__ void _process_tile_cuda( //
  * @param b_row Row index of the second input tile in the global matrix.
  * @param b_col Column index of the second input tile in the global matrix.
  */
-template <uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
+template <std::uint32_t tile_size, bool synchronize = true, bool may_be_diagonal = true>
 __forceinline__ __device__ void _process_tile_cuda( //
     votes_count_tile<tile_size>& c,                 //
     votes_count_tile<tile_size> const& a,           //
@@ -132,11 +136,11 @@ __forceinline__ __device__ void _process_tile_cuda( //
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         votes_count_t smallest = min(a[bi][k], b[k][bj]);
         if constexpr (may_be_diagonal) {
-            uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
-            uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
-            uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
-            uint32_t is_bigger = smallest > c_cell;
-            uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+            std::uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+            std::uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
+            std::uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
+            std::uint32_t is_bigger = smallest > c_cell;
+            std::uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
             if (will_replace)
                 c_cell = smallest;
         } else
@@ -156,7 +160,7 @@ __forceinline__ __device__ void _process_tile_cuda( //
  * @param k The index of the current tile being processed.
  * @param graph The graph of strongest paths.
  */
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 __global__ void _cuda_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const bi = threadIdx.y;
     candidate_idx_t const bj = threadIdx.x;
@@ -183,7 +187,7 @@ __global__ void _cuda_diagonal(candidate_idx_t n, candidate_idx_t k, votes_count
  * @param k The index of the current tile being processed.
  * @param graph The graph of strongest paths.
  */
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 __global__ void _cuda_partially_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const i = blockIdx.x;
     candidate_idx_t const bi = threadIdx.y;
@@ -232,7 +236,7 @@ __global__ void _cuda_partially_independent(candidate_idx_t n, candidate_idx_t k
  * @param k The index of the current tile being processed.
  * @param graph The graph of strongest paths.
  */
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 __global__ void _cuda_independent(candidate_idx_t n, candidate_idx_t k, votes_count_t* graph) {
     candidate_idx_t const j = blockIdx.x;
     candidate_idx_t const i = blockIdx.y;
@@ -283,7 +287,7 @@ __global__ void _cuda_independent(candidate_idx_t n, candidate_idx_t k, votes_co
  * @param k The index of the current tile being processed.
  * @param graph The graph of strongest paths represented as a `CUtensorMap`.
  */
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 __global__ void _cuda_independent_hopper(candidate_idx_t n, candidate_idx_t k,
                                          __grid_constant__ CUtensorMap const graph) {
     candidate_idx_t const j = blockIdx.x;
@@ -414,7 +418,7 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
  * @param row_stride The stride between rows in the preferences matrix.
  * @param graph The output matrix of strongest paths.
  */
-template <uint32_t tile_size>      //
+template <std::uint32_t tile_size> //
 void compute_strongest_paths_cuda( //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph,
     bool allow_tma) {
@@ -441,17 +445,17 @@ void compute_strongest_paths_cuda( //
 
     CUtensorMap strongest_paths_tensor_map{};
     // rank is the number of dimensions of the array.
-    constexpr uint32_t rank = 2;
+    constexpr std::uint32_t rank = 2;
     uint64_t size[rank] = {num_candidates, num_candidates};
     // The stride is the number of bytes to traverse from the first element of one row to the next.
     // It must be a multiple of 16.
     uint64_t stride[rank - 1] = {num_candidates * sizeof(votes_count_t)};
     // The box_size is the size of the shared memory buffer that is used as the
     // destination of a TMA transfer.
-    uint32_t box_size[rank] = {tile_size, tile_size};
+    std::uint32_t box_size[rank] = {tile_size, tile_size};
     // The distance between elements in units of sizeof(element). A stride of 2
     // can be used to load only the real component of a complex-valued tensor, for instance.
-    uint32_t elem_stride[rank] = {1, 1};
+    std::uint32_t elem_stride[rank] = {1, 1};
 
     // Create the tensor descriptor.
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
@@ -494,6 +498,8 @@ void compute_strongest_paths_cuda( //
     }
 }
 
+#endif // defined(__NVCC__)
+
 /**
  * @brief   Processes a tile of the preferences matrix for the block-parallel Schulze
  *          voting algorithm on CPU using @b OpenMP.
@@ -513,7 +519,7 @@ void compute_strongest_paths_cuda( //
  * @param b_row Row index of the second input tile in the global matrix.
  * @param b_col Column index of the second input tile in the global matrix.
  */
-template <uint32_t tile_size, bool may_be_diagonal = true>
+template <std::uint32_t tile_size, bool may_be_diagonal = true>
 inline void _process_tile_openmp(                 //
     votes_count_tile<tile_size>& c,               //
     votes_count_tile<tile_size> const& a,         //
@@ -528,11 +534,11 @@ inline void _process_tile_openmp(                 //
                 votes_count_t& c_cell = c[bi][bj];
                 votes_count_t smallest = std::min(a[bi][k], b[k][bj]);
                 if constexpr (may_be_diagonal) {
-                    uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
-                    uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
-                    uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
-                    uint32_t is_bigger = smallest > c_cell;
-                    uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
+                    std::uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
+                    std::uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
+                    std::uint32_t is_not_diagonal_b = (b_row + k) != (b_col + bj);
+                    std::uint32_t is_bigger = smallest > c_cell;
+                    std::uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
                     if (will_replace)
                         c_cell = smallest;
                 } else
@@ -542,21 +548,21 @@ inline void _process_tile_openmp(                 //
     }
 }
 
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_tile<tile_size>& target) {
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
             target[i][j] = source[i * stride + j];
 }
 
-template <uint32_t tile_size>
+template <std::uint32_t tile_size>
 void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride, votes_count_t* target) {
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
             target[i * stride + j] = source[i][j];
 }
 
-template <uint32_t tile_size>        //
+template <std::uint32_t tile_size>   //
 void compute_strongest_paths_openmp( //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph) {
 
@@ -678,11 +684,9 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     auto result_buf = result.request();
     auto result_ptr = reinterpret_cast<votes_count_t*>(result_buf.ptr);
 
-    if (!allow_gpu) {
-        omp_set_dynamic(0); // Explicitly disable dynamic teams
-        omp_set_num_threads(std::thread::hardware_concurrency());
-        compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
-    } else {
+#if defined(__NVCC__)
+
+    if (allow_gpu) {
         votes_count_t* strongest_paths_ptr = nullptr;
         cudaError_t error;
         error = cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
@@ -718,8 +722,13 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
         error = cudaFree(strongest_paths_ptr);
         if (error != cudaSuccess)
             throw std::runtime_error("Failed to free memory on device");
+        return result;
     }
+#endif // defined(__NVCC__)
 
+    omp_set_dynamic(0); // Explicitly disable dynamic teams
+    omp_set_num_threads(std::thread::hardware_concurrency());
+    compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
     return result;
 }
 
@@ -728,7 +737,8 @@ PYBIND11_MODULE(scaling_democracy, m) {
     std::signal(SIGINT, signal_handler);
 
     // Let's show how to wrap `void` functions for basic logging
-    m.def("log_devices", []() {
+    m.def("log_gpus", []() {
+#if defined(__NVCC__)
         int device_count;
         cudaDeviceProp device_props;
         cudaError_t error = cudaGetDeviceCount(&device_count);
@@ -743,16 +753,23 @@ PYBIND11_MODULE(scaling_democracy, m) {
             printf("\tGlobal mem: %.2fGB\n", static_cast<float>(device_props.totalGlobalMem) / (1024 * 1024 * 1024));
             printf("\tCUDA Cap: %d.%d\n", device_props.major, device_props.minor);
         }
+#else
+        printf("No CUDA devices available\n");
+#endif
     });
 
     // This is how we could have used `thrust::` for higher-level operations
     m.def("reduce", [](py::array_t<float> const& data) -> float {
+#if defined(__NVCC__)
         py::buffer_info buf = data.request();
         if (buf.ndim != 1 || buf.strides[0] != sizeof(float))
             throw std::runtime_error("Input should be a contiguous 1D float array");
         float* ptr = static_cast<float*>(buf.ptr);
         thrust::device_vector<float> d_data(ptr, ptr + buf.size);
         return thrust::reduce(thrust::device, d_data.begin(), d_data.end(), 0.0f);
+#else
+        return std::accumulate(data.data(), data.data() + data.size(), 0.0f);
+#endif
     });
 
     m.def("compute_strongest_paths", &compute_strongest_paths, //

@@ -11,11 +11,19 @@ import numpy as np
 class BuildExt(build_ext):
     def build_extensions(self):
         self.compiler.src_extensions.append(".cu")
+        nvcc_available = self.is_nvcc_available()
+
         for ext in self.extensions:
             if any(source.endswith(".cu") for source in ext.sources):
-                self.build_cuda_extension(ext)
+                if nvcc_available:
+                    self.build_cuda_extension(ext)
+                else:
+                    self.build_gcc_extension(ext)
             else:
                 super().build_extension(ext)
+
+    def is_nvcc_available(self):
+        return os.system("which nvcc > /dev/null 2>&1") == 0
 
     def build_cuda_extension(self, ext):
         # Compile CUDA source files
@@ -43,6 +51,38 @@ class BuildExt(build_ext):
             target_lang=ext.language,
         )
 
+    def build_gcc_extension(self, ext):
+        # Compile all source files with GCC, including treating .cu files as .cpp files
+        objects = []
+        for source in ext.sources:
+            if source.endswith(".cu"):
+                obj = self.compiler.compile(
+                    [source],
+                    output_dir=self.build_temp,
+                    extra_preargs=["-x", "c++"],
+                    extra_postargs=["-fPIC", "-fopenmp"],
+                    include_dirs=ext.include_dirs,
+                )
+            else:
+                obj = self.compiler.compile(
+                    [source],
+                    output_dir=self.build_temp,
+                    extra_postargs=["-fPIC", "-fopenmp"],
+                    include_dirs=ext.include_dirs,
+                )
+            objects.extend(obj)
+
+        # Link all object files
+        self.compiler.link_shared_object(
+            objects,
+            self.get_ext_fullpath(ext.name),
+            libraries=[lib for lib in ext.libraries if not lib.startswith("cu")],
+            library_dirs=ext.library_dirs,
+            runtime_library_dirs=ext.runtime_library_dirs,
+            extra_postargs=ext.extra_link_args,
+            target_lang=ext.language,
+        )
+
     def compile_cuda(self, source):
         # Compile CUDA source file using nvcc
         ext = self.extensions[0]
@@ -59,7 +99,8 @@ class BuildExt(build_ext):
         # Hopper: -arch=sm_90
         # https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
         cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_90,code=compute_90 -Xcompiler -fPIC {include_dirs}"
-        os.system(cmd)
+        if os.system(cmd) != 0:
+            raise RuntimeError(f"nvcc compilation of {source} failed")
 
 
 __version__ = "0.0.1"
