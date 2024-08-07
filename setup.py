@@ -92,18 +92,35 @@ class BuildExt(build_ext):
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
         output_file = os.path.join(output_dir, "scaling_democracy.o")
 
+        # Let's try inferring the compute capability from the GPU
         # Kepler: -arch=sm_30
         # Turing: -arch=sm_75
         # Ampere: -arch=sm_86
         # Ada: -arch=sm_89
         # Hopper: -arch=sm_90
         # https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
-        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_90,code=compute_90 -Xcompiler -fPIC {include_dirs}"
+        arch_code = "90"
+        try:
+            import pycuda.driver as cuda
+            import pycuda.autoinit
+
+            device = cuda.Device(0)  # Get the default device
+            major, minor = device.compute_capability()
+            arch_code = f"{major}{minor}"
+        except ImportError:
+            pass
+
+        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_{arch_code},code=compute_{arch_code} -Xcompiler -fPIC {include_dirs}"
         if os.system(cmd) != 0:
             raise RuntimeError(f"nvcc compilation of {source} failed")
 
 
 __version__ = "0.0.1"
+
+long_description = ""
+this_directory = os.path.abspath(os.path.dirname(__file__))
+with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f:
+    long_description = f.read()
 
 # Get Python library path dynamically
 python_lib_dir = get_python_lib(standard_lib=True)
@@ -151,7 +168,7 @@ setup(
     author_email="1983160+ashvardanian@users.noreply.github.com",
     url="https://github.com/ashvardanian/scaling-democracy",
     description="GPU-accelerated Schulze voting algorithm",
-    long_description="",
+    long_description=long_description,
     ext_modules=ext_modules,
     extras_require={"test": "pytest"},
     cmdclass={"build_ext": BuildExt},
