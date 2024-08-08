@@ -178,6 +178,7 @@ def compute_strongest_paths_numba_parallel(
             strongest_paths,
             k_start,
             k_start,
+            tile_size,
         )
 
         # Partially dependent phase (first of two)
@@ -196,6 +197,7 @@ def compute_strongest_paths_numba_parallel(
                 strongest_paths,
                 k_start,
                 k_start,
+                tile_size,
             )
 
         # Partially dependent phase (second of two)
@@ -214,6 +216,7 @@ def compute_strongest_paths_numba_parallel(
                 strongest_paths,
                 k_start,
                 j_start,
+                tile_size,
             )
 
         # Independent phase
@@ -236,6 +239,7 @@ def compute_strongest_paths_numba_parallel(
                     strongest_paths,
                     k_start,
                     j_start,
+                    tile_size,
                 )
 
     return strongest_paths
@@ -307,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tile-size",
         type=int,
-        default=16,
+        default=0,
         help="Tile size for the tiling optimization",
     )
     args = parser.parse_args()
@@ -320,16 +324,25 @@ if __name__ == "__main__":
         x,
         allow_gpu=True,
         allow_tma=False,
+        tile_size=tile_size,
     )
     compute_strongest_paths_h100 = lambda x: compute_strongest_paths(
         x,
         allow_gpu=True,
         allow_tma=False,
+        tile_size=tile_size,
     )
     compute_strongest_paths_openmp = lambda x: compute_strongest_paths(
         x,
         allow_gpu=False,
         allow_tma=False,
+        tile_size=tile_size,
+    )
+    compute_strongest_paths_numba_tiled = (
+        lambda x: compute_strongest_paths_numba_parallel(
+            x,
+            tile_size=tile_size,
+        )
     )
 
     # Generate random voter rankings
@@ -352,25 +365,32 @@ if __name__ == "__main__":
 
     # To avoid cold-start and aggregating JIT costs, let's run all functions on tiny inputs first
     sub_preferences = preferences[: num_candidates // 8, : num_candidates // 8]
-    sub_preferences_baseline = compute_strongest_paths_numba_parallel(sub_preferences)
+    sub_preferences_baseline = compute_strongest_paths_numba_serial(sub_preferences)
 
     for name, wanted, callback in [
-        ("Numba", args.run_numba, compute_strongest_paths_numba_parallel),
+        ("Numba", args.run_numba, compute_strongest_paths_numba_tiled),
         ("CUDA", args.run_cuda, compute_strongest_paths_cuda),
         ("CUDA with TMA", args.run_cuda, compute_strongest_paths_h100),
         ("OpenMP", args.run_openmp, compute_strongest_paths_openmp),
         ("Serial", args.run_serial, compute_strongest_paths_numba_serial),
     ]:
         if not wanted:
-            print(f"Skipping {name}")
+            print(f"↷ Skipping {name}")
             continue
 
-        start_time = time.time()
-        sub_preferences_result = callback(sub_preferences)
-        elapsed_time = time.time() - start_time
+        try:
+            start_time = time.time()
+            sub_preferences_result = callback(sub_preferences)
+            elapsed_time = time.time() - start_time
+        except Exception as e:
+            print(f"✘ Error: {name} raised an exception: {e}")
+            continue
+
         print(f"{name} warm-up: {elapsed_time:.4f} secs")
         if not np.array_equal(sub_preferences_result, sub_preferences_baseline):
-            print(f"Error: {name} returned different results from Numba baseline")
+            print(f"✘ Error: {name} returned different results from Numba baseline")
+        else:
+            print(f"✔ {name} returned correct results")
 
         # Run the benchmark
         start_time = time.time()
@@ -384,5 +404,5 @@ if __name__ == "__main__":
     winner, ranking = get_winner_and_ranking(candidates, sub_preferences)
 
     # Print the results
-    print(f"Winner is {winner}")
-    print(f"Ranked {len(ranking)} candidates")
+    print(f"    Winner is {winner}")
+    print(f"    Ranked {len(ranking)} candidates")

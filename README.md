@@ -1,8 +1,9 @@
-# Scaling Democracy
+# Scaling ~~Piracy~~ Democracy
 
 ## With GPUs & Algebraic Graph Theory
 
 This repository implements the Schulze voting algorithm using CUDA for hardware acceleration.
+That algorithm is often used by Pirate Parties and open-source foundations, and it's a good example of a combinatorial problem that can be parallelized efficiently on GPUs.
 It's built as a single `scaling_democracy.cu` CUDA file, wrapped with PyBind11, and compiled __without__ CMake directly from the `setup.py`.
 To pull, build and benchmark locally:
 

@@ -2,10 +2,17 @@
  * @brief  CUDA-accelerated Schulze voting alrogithm implementation.
  * @author Ash Vardanian
  * @date   July 12, 2024
+ * @file   scaling_democracy.cu
+ * @see    https://ashvardanian.com/scaling-democracy
  */
-#include <csignal> // `std::signal`
-#include <cstdint> // `std::uint32_t`
-#include <thread>  // `std::thread::hardware_concurrency()`
+#include <algorithm> // `std::min`, `std::max`
+#include <csignal>   // `std::signal`
+#include <cstdint>   // `std::uint32_t`
+#include <cstdio>    // `std::printf`
+#include <cstdlib>   // `std::rand`
+#include <stdexcept> // `std::runtime_error`
+#include <thread>    // `std::thread::hardware_concurrency()`
+#include <vector>    // `std::vector`
 
 #include <omp.h> // `omp_set_num_threads`
 
@@ -22,9 +29,16 @@
 #include <thrust/execution_policy.h>
 #endif
 
+/*
+ * If we are only testing the raw kernels, we don't need to link to PyBind.
+ */
+#if !defined(SCALING_DEMOCRACY_TEST)
 #include <pybind11/numpy.h> // `array_t`
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+namespace py = pybind11;
+#endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
 #define SCALING_DEMOCRACY_KEPLER 1
@@ -32,8 +46,6 @@
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define SCALING_DEMOCRACY_HOPPER 1
 #endif
-
-namespace py = pybind11;
 
 using votes_count_t = std::uint32_t;
 using candidate_idx_t = std::uint32_t;
@@ -46,6 +58,8 @@ template <std::uint32_t tile_size> using votes_count_tile = votes_count_t[tile_s
 volatile std::sig_atomic_t global_signal_status = 0;
 
 void signal_handler(int signal) { global_signal_status = signal; }
+
+#pragma region CUDA
 
 #if defined(__NVCC__)
 
@@ -204,6 +218,7 @@ __global__ void _cuda_partially_independent(candidate_idx_t n, candidate_idx_t k
     __shared__ alignas(16) votes_count_tile<tile_size> b;
     __shared__ alignas(16) votes_count_tile<tile_size> c;
 
+    // Partially dependent phase (first of two)
     // Walking down within a group of adjacent columns
     c[bi][bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj];
     b[bi][bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj];
@@ -215,6 +230,7 @@ __global__ void _cuda_partially_independent(candidate_idx_t n, candidate_idx_t k
         i * tile_size, k * tile_size, //
         k * tile_size, k * tile_size);
 
+    // Partially dependent phase (second of two)
     // Walking right within a group of adjacent rows
     __syncthreads();
     graph[i * tile_size * n + k * tile_size + bi * n + bj] = c[bi][bj];
@@ -504,6 +520,9 @@ void compute_strongest_paths_cuda( //
 
 #endif // defined(__NVCC__)
 
+#pragma endregion CUDA
+
+#pragma region OpenMP
 /**
  * @brief   Processes a tile of the preferences matrix for the block-parallel Schulze
  *          voting algorithm on CPU using @b OpenMP.
@@ -533,7 +552,7 @@ inline void _process_tile_openmp(                 //
     candidate_idx_t b_row, candidate_idx_t b_col) {
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+    if constexpr (std::is_same<votes_count_t, std::uint32_t>()) {
         uint32x4_t bj_step = {0, 1, 2, 3};
         for (candidate_idx_t k = 0; k < tile_size; k++) {
             for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
@@ -567,8 +586,7 @@ inline void _process_tile_openmp(                 //
         }
         return;
     }
-#endif
-
+#else
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
             for (candidate_idx_t bj = 0; bj < tile_size; bj++) {
@@ -588,13 +606,15 @@ inline void _process_tile_openmp(                 //
             }
         }
     }
+#endif
 }
 
-template <std::uint32_t tile_size>
-void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_tile<tile_size>& target) {
+template <std::uint32_t tile_size, bool check_tail = false>
+void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_tile<tile_size>& target,
+              candidate_idx_t remaining_rows, candidate_idx_t remaining_cols) {
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+    if constexpr (std::is_same<votes_count_t, std::uint32_t>()) {
         for (candidate_idx_t i = 0; i < tile_size; i++) {
 #pragma unroll full
             for (candidate_idx_t j = 0; j < tile_size; j += 4) {
@@ -603,18 +623,24 @@ void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_t
         }
         return;
     }
-#endif
+#else
 
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
-            target[i][j] = source[i * stride + j];
+            if constexpr (check_tail) {
+                if (i < remaining_rows && j < remaining_cols)
+                    target[i][j] = source[i * stride + j];
+            } else
+                target[i][j] = source[i * stride + j];
+#endif
 }
 
-template <std::uint32_t tile_size>
-void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride, votes_count_t* target) {
+template <std::uint32_t tile_size, bool check_tail = false>
+void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride, votes_count_t* target,
+              candidate_idx_t remaining_rows, candidate_idx_t remaining_cols) {
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    if constexpr (std::is_same_v<votes_count_t, std::uint32_t>) {
+    if constexpr (std::is_same<votes_count_t, std::uint32_t>() && !check_tail) {
         for (candidate_idx_t i = 0; i < tile_size; i++) {
 #pragma unroll full
             for (candidate_idx_t j = 0; j < tile_size; j += 4) {
@@ -623,18 +649,23 @@ void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride,
         }
         return;
     }
-#endif
-
+#else
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
-            target[i * stride + j] = source[i][j];
+            if constexpr (check_tail) {
+                if (i < remaining_rows && j < remaining_cols)
+                    target[i * stride + j] = source[i][j];
+            } else
+                target[i * stride + j] = source[i][j];
+#endif
 }
 
-template <std::uint32_t tile_size>   //
-void compute_strongest_paths_openmp( //
+template <std::uint32_t tile_size, bool check_tail = false> //
+void compute_strongest_paths_openmp(                        //
     votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph) {
 
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic) collapse(2)
+    // Populate the strongest paths matrix based on direct comparisons
     for (candidate_idx_t i = 0; i < num_candidates; i++)
         for (candidate_idx_t j = 0; j < num_candidates; j++)
             if (i != j)
@@ -642,6 +673,8 @@ void compute_strongest_paths_openmp( //
                     preferences[i * row_stride + j] > preferences[j * row_stride + i] //
                         ? preferences[i * row_stride + j]
                         : 0;
+            else
+                graph[i * num_candidates + j] = 0;
 
     // Time for the actual core implementation
     candidate_idx_t const tiles_count = (num_candidates + tile_size - 1) / tile_size;
@@ -653,79 +686,97 @@ void compute_strongest_paths_openmp( //
         // Dependent phase
         {
             alignas(64) votes_count_t c[tile_size][tile_size];
-            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, c);
+            memcpy2d<tile_size, check_tail>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, c,
+                                            num_candidates - k * tile_size, num_candidates - k * tile_size);
             _process_tile_openmp<tile_size>(  //
                 c, c, c,                      //
                 tile_size * k, tile_size * k, //
                 tile_size * k, tile_size * k, //
                 tile_size * k, tile_size * k  //
             );
-            memcpy2d<tile_size>(c, num_candidates, graph + k * tile_size * num_candidates + k * tile_size);
+            memcpy2d<tile_size, check_tail>(c, num_candidates, graph + k * tile_size * num_candidates + k * tile_size,
+                                            num_candidates - k * tile_size, num_candidates - k * tile_size);
         }
-        // Partially independent phase (first of two)
-#pragma omp parallel for
+        // Partially dependent phase (first of two)
+#pragma omp parallel for schedule(dynamic)
         for (candidate_idx_t i = 0; i < tiles_count; i++) {
             if (i == k)
                 continue;
             alignas(64) votes_count_tile<tile_size> b;
             alignas(64) votes_count_tile<tile_size> c;
-            memcpy2d<tile_size>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates, c);
-            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, b);
+            memcpy2d<tile_size, check_tail>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates, c,
+                                            num_candidates - i * tile_size, num_candidates - k * tile_size);
+            memcpy2d<tile_size, check_tail>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, b,
+                                            num_candidates - k * tile_size, num_candidates - k * tile_size);
             _process_tile_openmp<tile_size>(  //
                 c, c, b,                      //
                 i * tile_size, k * tile_size, //
                 i * tile_size, k * tile_size, //
                 k * tile_size, k * tile_size);
-            memcpy2d<tile_size>(c, num_candidates, graph + i * tile_size * num_candidates + k * tile_size);
+            memcpy2d<tile_size, check_tail>(c, num_candidates, graph + i * tile_size * num_candidates + k * tile_size,
+                                            num_candidates - i * tile_size, num_candidates - k * tile_size);
         }
-        // Partially independent phase (second of two)
-#pragma omp parallel for
-        for (candidate_idx_t i = 0; i < tiles_count; i++) {
-            if (i == k)
+        // Partially dependent phase (second of two)
+#pragma omp parallel for schedule(dynamic)
+        for (candidate_idx_t j = 0; j < tiles_count; j++) {
+            if (j == k)
                 continue;
             alignas(64) votes_count_tile<tile_size> a;
             alignas(64) votes_count_tile<tile_size> c;
-            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + i * tile_size, num_candidates, c);
-            memcpy2d<tile_size>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, a);
+            memcpy2d<tile_size, check_tail>(graph + k * tile_size * num_candidates + j * tile_size, num_candidates, c,
+                                            num_candidates - k * tile_size, num_candidates - j * tile_size);
+            memcpy2d<tile_size, check_tail>(graph + k * tile_size * num_candidates + k * tile_size, num_candidates, a,
+                                            num_candidates - k * tile_size, num_candidates - k * tile_size);
             _process_tile_openmp<tile_size>(  //
                 c, a, c,                      //
-                k * tile_size, i * tile_size, //
+                k * tile_size, j * tile_size, //
                 k * tile_size, k * tile_size, //
-                k * tile_size, i * tile_size  //
+                k * tile_size, j * tile_size  //
             );
-            memcpy2d<tile_size>(c, num_candidates, graph + k * tile_size * num_candidates + i * tile_size);
+            memcpy2d<tile_size, check_tail>(c, num_candidates, graph + k * tile_size * num_candidates + j * tile_size,
+                                            num_candidates - k * tile_size, num_candidates - j * tile_size);
         }
         // Independent phase
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic) collapse(2)
         for (candidate_idx_t i = 0; i < tiles_count; i++) {
             for (candidate_idx_t j = 0; j < tiles_count; j++) {
-                if (i == k && j == k)
+                if (i == k || j == k)
                     continue;
                 alignas(64) votes_count_tile<tile_size> a;
                 alignas(64) votes_count_tile<tile_size> b;
                 alignas(64) votes_count_tile<tile_size> c;
-                memcpy2d<tile_size>(graph + i * tile_size * num_candidates + j * tile_size, num_candidates, c);
-                memcpy2d<tile_size>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates, a);
-                memcpy2d<tile_size>(graph + k * tile_size * num_candidates + j * tile_size, num_candidates, b);
-                if (i == j)
-                    _process_tile_openmp<tile_size, true>( //
-                        c, a, b,                           //
-                        i * tile_size, j * tile_size,      //
-                        i * tile_size, k * tile_size,      //
-                        k * tile_size, j * tile_size       //
-                    );
-                else
+                memcpy2d<tile_size, check_tail>(graph + i * tile_size * num_candidates + j * tile_size, num_candidates,
+                                                c, num_candidates - i * tile_size, num_candidates - j * tile_size);
+                memcpy2d<tile_size, check_tail>(graph + i * tile_size * num_candidates + k * tile_size, num_candidates,
+                                                a, num_candidates - i * tile_size, num_candidates - k * tile_size);
+                memcpy2d<tile_size, check_tail>(graph + k * tile_size * num_candidates + j * tile_size, num_candidates,
+                                                b, num_candidates - k * tile_size, num_candidates - j * tile_size);
+                if (i != j)
                     _process_tile_openmp<tile_size, false>( //
                         c, a, b,                            //
                         i * tile_size, j * tile_size,       //
                         i * tile_size, k * tile_size,       //
                         k * tile_size, j * tile_size        //
                     );
-                memcpy2d<tile_size>(c, num_candidates, graph + i * tile_size * num_candidates + j * tile_size);
+                else
+                    _process_tile_openmp<tile_size, true>( //
+                        c, a, b,                           //
+                        i * tile_size, j * tile_size,      //
+                        i * tile_size, k * tile_size,      //
+                        k * tile_size, j * tile_size       //
+                    );
+                memcpy2d<tile_size, check_tail>(c, num_candidates,
+                                                graph + i * tile_size * num_candidates + j * tile_size,
+                                                num_candidates - i * tile_size, num_candidates - j * tile_size);
             }
         }
     }
 }
+
+#pragma endregion OpenMP
+
+#pragma region Python bindings
+#if !defined(SCALING_DEMOCRACY_TEST)
 
 /**
  * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm.
@@ -751,6 +802,9 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     auto result = py::array_t<votes_count_t>({num_candidates, num_candidates});
     auto result_buf = result.request();
     auto result_ptr = reinterpret_cast<votes_count_t*>(result_buf.ptr);
+    auto result_row_stride = static_cast<candidate_idx_t>(result_buf.strides[0] / sizeof(votes_count_t));
+    if (result_row_stride != num_candidates)
+        throw std::runtime_error("Result matrix must be contiguous");
 
 #if defined(__NVCC__)
 
@@ -761,8 +815,20 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
         if (error != cudaSuccess)
             throw std::runtime_error("Failed to allocate memory on device");
 
+        using cuda_kernel_t = void (*)(votes_count_t*, candidate_idx_t, candidate_idx_t, votes_count_t*, bool);
+        cuda_kernel_t cuda_kernel = nullptr;
+        switch (tile_size) {
+        case 4: cuda_kernel = &compute_strongest_paths_cuda<4>; break;
+        case 8: cuda_kernel = &compute_strongest_paths_cuda<8>; break;
+        case 16: cuda_kernel = &compute_strongest_paths_cuda<16>; break;
+        case 32: cuda_kernel = &compute_strongest_paths_cuda<32>; break;
+        case 64: cuda_kernel = &compute_strongest_paths_cuda<64>; break;
+        case 128: cuda_kernel = &compute_strongest_paths_cuda<128>; break;
+        default: throw std::runtime_error("Unsupported tile size");
+        }
+
         cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
-        compute_strongest_paths_cuda<16>(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
+        cuda_kernel(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
 
         // Synchronize to ensure all CUDA operations are complete
         error = cudaDeviceSynchronize();
@@ -794,20 +860,56 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     }
 #endif // defined(__NVCC__)
 
-    omp_set_dynamic(0); // Explicitly disable dynamic teams
+    omp_set_dynamic(0); // ? Explicitly disable dynamic teams
     omp_set_num_threads(std::thread::hardware_concurrency());
-    if (tile_size == 0)
-        compute_strongest_paths_openmp<64>(preferences_ptr, num_candidates, row_stride, result_ptr);
-    else if (tile_size == 16)
-        compute_strongest_paths_openmp<16>(preferences_ptr, num_candidates, row_stride, result_ptr);
-    else if (tile_size == 32)
-        compute_strongest_paths_openmp<32>(preferences_ptr, num_candidates, row_stride, result_ptr);
-    else if (tile_size == 64)
-        compute_strongest_paths_openmp<64>(preferences_ptr, num_candidates, row_stride, result_ptr);
-    else if (tile_size == 128)
-        compute_strongest_paths_openmp<128>(preferences_ptr, num_candidates, row_stride, result_ptr);
+
+    // Probe for the largest possible tile size, if not previously specified
+    using kernel_t = void (*)(votes_count_t*, candidate_idx_t, candidate_idx_t, votes_count_t*);
+    struct {
+        std::size_t tile_size;
+        kernel_t aligned_kernel;
+        kernel_t unaligned_kernel;
+    } tiled_kernels[] = {
+        {4, compute_strongest_paths_openmp<4, false>, compute_strongest_paths_openmp<4, true>},
+        {8, compute_strongest_paths_openmp<8, false>, compute_strongest_paths_openmp<8, true>},
+        {16, compute_strongest_paths_openmp<16, false>, compute_strongest_paths_openmp<16, true>},
+        {32, compute_strongest_paths_openmp<32, false>, compute_strongest_paths_openmp<32, true>},
+        {64, compute_strongest_paths_openmp<64, false>, compute_strongest_paths_openmp<64, true>},
+        {128, compute_strongest_paths_openmp<128, false>, compute_strongest_paths_openmp<128, true>},
+    };
+    kernel_t aligned_kernel = nullptr;
+    kernel_t unaligned_kernel = nullptr;
+    if (tile_size == 0) {
+        for (auto const& kernel : tiled_kernels) {
+            if (num_candidates >= kernel.tile_size) {
+                tile_size = kernel.tile_size;
+                aligned_kernel = kernel.aligned_kernel;
+                unaligned_kernel = kernel.unaligned_kernel;
+                break;
+            }
+        }
+        if (tile_size == 0)
+            throw std::runtime_error("Number of candidates should be at least 4, ideally divisible by 4");
+    } else {
+        if (tile_size > num_candidates)
+            throw std::runtime_error("Tile size should be less than or equal to the number of candidates");
+        for (auto const& kernel : tiled_kernels) {
+            if (tile_size == kernel.tile_size) {
+                aligned_kernel = kernel.aligned_kernel;
+                unaligned_kernel = kernel.unaligned_kernel;
+                break;
+            }
+        }
+        if (aligned_kernel == nullptr)
+            throw std::runtime_error("Unsupported tile size");
+    }
+
+    // Check if we can use the aligned kernel
+    bool is_aligned = num_candidates % tile_size == 0;
+    if (is_aligned)
+        aligned_kernel(preferences_ptr, num_candidates, row_stride, result_ptr);
     else
-        throw std::runtime_error("Unsupported tile size");
+        unaligned_kernel(preferences_ptr, num_candidates, row_stride, result_ptr);
     return result;
 }
 
@@ -827,13 +929,14 @@ PYBIND11_MODULE(scaling_democracy, m) {
             error = cudaGetDeviceProperties(&device_props, i);
             if (error != cudaSuccess)
                 throw std::runtime_error("Failed to get device properties");
-            printf("Device %d: %s\n", i, device_props.name);
-            printf("\tSMs: %d\n", device_props.multiProcessorCount);
-            printf("\tGlobal mem: %.2fGB\n", static_cast<float>(device_props.totalGlobalMem) / (1024 * 1024 * 1024));
-            printf("\tCUDA Cap: %d.%d\n", device_props.major, device_props.minor);
+            std::printf("Device %d: %s\n", i, device_props.name);
+            std::printf("\tSMs: %d\n", device_props.multiProcessorCount);
+            std::printf("\tGlobal mem: %.2fGB\n",
+                        static_cast<float>(device_props.totalGlobalMem) / (1024 * 1024 * 1024));
+            std::printf("\tCUDA Cap: %d.%d\n", device_props.major, device_props.minor);
         }
 #else
-        printf("No CUDA devices available\n");
+        throw std::runtime_error("No CUDA devices available\n");
 #endif
     });
 
@@ -857,3 +960,23 @@ PYBIND11_MODULE(scaling_democracy, m) {
           py::arg("allow_gpu") = false,                        //
           py::arg("tile_size") = 0);
 }
+
+#endif // !defined(SCALING_DEMOCRACY_TEST)
+#pragma endregion Python bindings
+
+#if defined(SCALING_DEMOCRACY_TEST)
+
+int main() {
+
+    std::size_t num_candidates = 256;
+    std::vector<votes_count_t> preferences(num_candidates * num_candidates);
+    std::generate(preferences.begin(), preferences.end(),
+                  [=]() { return static_cast<votes_count_t>(std::rand() % num_candidates); });
+
+    std::vector<votes_count_t> graph(num_candidates * num_candidates);
+    compute_strongest_paths_openmp<64>(preferences.data(), num_candidates, num_candidates, graph.data());
+
+    return 0;
+}
+
+#endif // defined(SCALING_DEMOCRACY_TEST)
