@@ -110,7 +110,7 @@ class BuildExt(build_ext):
         except ImportError:
             pass
 
-        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_{arch_code},code=compute_{arch_code} -Xcompiler -fPIC {include_dirs}"
+        cmd = f"nvcc -c {source} -o {output_file} -std=c++17 -gencode=arch=compute_{arch_code},code=compute_{arch_code} -Xcompiler -fPIC {include_dirs} -O3 -g"
         if os.system(cmd) != 0:
             raise RuntimeError(f"nvcc compilation of {source} failed")
 
