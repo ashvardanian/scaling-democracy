@@ -346,7 +346,10 @@ if __name__ == "__main__":
     )
 
     # Generate random voter rankings
-    log_gpus()
+    try:
+        log_gpus()
+    except Exception as e:
+        print(f"✘ Error: Could not log GPUs: {e}")
     print(
         f"Generating {num_voters:,} random voter rankings with {num_candidates:,} candidates"
     )

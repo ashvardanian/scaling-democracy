@@ -32,15 +32,20 @@ CUDA: 1.9802 seconds, 277,620,752,084.85 candidates^3/sec
 
 CUDA outperforms the baseline JIT-compiled parallel kernel by a factor of __34.55x__.
 40 core CPU uses ~270 Watts, so 10 cores use ~67.5 Watts.
-Our SXM Nvidia H100 has a ~700 Watt TDP, but consumes only 360 under such load, so 5x more power-hungry, meaning the CUDA implementation is 7x more power-efficient than Numba. 
-As the matrix grows, the GPU utilization improves and the experimentally observed throughput fits a sub-cubic curve:
+Our SXM Nvidia H100 has a ~700 Watt TDP, but consumes only 360 under such load, so 5x more power-hungry, meaning the CUDA implementation is up to 7x more power-efficient than Numba on that Intel CPU.
+As the matrix grows, the GPU utilization improves and the experimentally observed throughput fits a sub-cubic curve.
+Comparing to Arm-based CPUs and native SIMD-accelerated code would be more fair.
+Repeating the experiment with 192-core AWS Graviton 4 chips, the timings with tile-size 32 are:
 
-- 8 K: 1.9 s
-- 16 K: 9.5 s
-- 32 K: 42.9 s
-- 48 K: 105.3 s
+| Candidates | Numba on `c8g` | OpenMP on `c8g` | OpenMP + NEON on `c8g` | CUDA on `h100` |
+| :--------- | -------------: | --------------: | ---------------------: | -------------: |
+| 2'048      |         1.14 s |          0.35 s |                 0.16 s |                |
+| 4'096      |         1.84 s |          1.02 s |                 0.35 s |                |
+| 8'192      |         7.49 s |          5.50 s |                 4.64 s |         1.98 s |
+| 16'384     |        38.04 s |         24.67 s |                24.20 s |         9.53 s |
+| 32'768     |       302.85 s |        246.85 s |               179.82 s |        42.90 s |
 
-Resources:
+Comparing the numbers, we are still looking at a roughly 4x speedup of CUDA for the largest matrix size tested for a comparable power consumption and hardware rental cost.
 
 - [Schulze voting method description](https://en.wikipedia.org/wiki/Schulze_method)
 - [On traversal order for Floyd Warshall algorithm](https://moorejs.github.io/APSP-in-parallel/)
