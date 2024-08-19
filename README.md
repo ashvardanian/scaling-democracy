@@ -1,6 +1,4 @@
-# Scaling ~~Piracy~~ Democracy
-
-## With GPUs & Algebraic Graph Theory
+![Scaling Democracy Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/scaling-democracy.jpg?raw=true)
 
 This repository implements the Schulze voting algorithm using CUDA for hardware acceleration.
 That algorithm is often used by Pirate Parties and open-source foundations, and it's a good example of a combinatorial problem that can be parallelized efficiently on GPUs.
@@ -16,7 +14,8 @@ pip install -e .
 python benchmark.py --num-candidates 128 --num-voters 128 --run-openmp --run-numba --run-serial --run-cuda
 ```
 
-It's a fun project by itself. It might be a good example of using GPUs for combinatorial problems with order-dependant traversal and also a good starting point for single-day CUDA hacking experiences with the header-only [CCCL](https://github.com/NVIDIA/cccl), containing Thrust, CUB, and `libcudacxx`.
+It's a fun project by itself.
+It might be a good example of using GPUs for combinatorial problems with order-dependant traversal and also a good starting point for single-day CUDA hacking experiences with the header-only [CCCL](https://github.com/NVIDIA/cccl), containing Thrust, CUB, and `libcudacxx`.
 
 ## Throughput
 
@@ -47,5 +46,9 @@ Repeating the experiment with 192-core AWS Graviton 4 chips, the timings with ti
 
 Comparing the numbers, we are still looking at a roughly 4x speedup of CUDA for the largest matrix size tested for a comparable power consumption and hardware rental cost.
 
+## Links
+
+- [Blogpost](https://ashvardanian.com/posts/scaling-democracy/)
 - [Schulze voting method description](https://en.wikipedia.org/wiki/Schulze_method)
 - [On traversal order for Floyd Warshall algorithm](https://moorejs.github.io/APSP-in-parallel/)
+- [CUDA + Python project template](https://github.com/ashvardanian/cuda-python-starter-kit)
