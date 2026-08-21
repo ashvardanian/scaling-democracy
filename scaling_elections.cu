@@ -374,7 +374,7 @@ __global__ void cuda_independent_hopper_(candidate_idx_t n, candidate_idx_t k,
 #pragma nv_diag_suppress static_var_with_dynamic_init
     // Initialize shared memory barrier with the number of threads participating in the barrier.
     __shared__ barrier_t bar;
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
         // We have one thread per tile cell.
         init(&bar, tile_size * tile_size);
         // Make initialized barrier visible in async proxy.
@@ -385,11 +385,12 @@ __global__ void cuda_independent_hopper_(candidate_idx_t n, candidate_idx_t k,
 
     // Only the first thread in the tile invokes the bulk transfers.
     barrier_t::arrival_token token;
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
         // Initiate three bulk tensor copies for different part of the graph.
-        cde::cp_async_bulk_tensor_2d_global_to_shared(&c, &graph, i * tile_size, j * tile_size, bar);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(&a, &graph, i * tile_size, k * tile_size, bar);
-        cde::cp_async_bulk_tensor_2d_global_to_shared(&b, &graph, k * tile_size, j * tile_size, bar);
+        // The first coordinate is the column, as dimension 0 is the contiguous one.
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&c, &graph, j * tile_size, i * tile_size, bar);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&a, &graph, k * tile_size, i * tile_size, bar);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(&b, &graph, j * tile_size, k * tile_size, bar);
         // Arrive on the barrier and tell how many bytes are expected to come in.
         token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(c) + sizeof(a) + sizeof(b));
     } else {
@@ -432,8 +433,8 @@ __global__ void cuda_independent_hopper_(candidate_idx_t n, candidate_idx_t k,
     // After `syncthreads`, writes by all threads are visible to TMA engine.
 
     // Initiate TMA transfer to copy shared memory to global memory
-    if (threadIdx.x == 0) {
-        cde::cp_async_bulk_tensor_2d_shared_to_global(&graph, i * tile_size, j * tile_size, &c);
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        cde::cp_async_bulk_tensor_2d_shared_to_global(&graph, j * tile_size, i * tile_size, &c);
         // Wait for TMA transfer to have finished reading shared memory.
         // Create a "bulk async-group" out of the previous bulk copy operation.
         cde::cp_async_bulk_commit_group();
