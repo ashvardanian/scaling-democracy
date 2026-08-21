@@ -1,10 +1,93 @@
 Language: Cpp
-BasedOnStyle:  LLVM
+BasedOnStyle: LLVM
 IndentWidth: 4
 TabWidth: 4
 NamespaceIndentation: None
 ColumnLimit: 120
 ReflowComments: true
 UseTab: Never
+
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: true
+AlignOperands: true
+AlignTrailingComments: true
+
+AllowAllArgumentsOnNextLine: false
+AllowAllConstructorInitializersOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: true
+AllowShortLambdasOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+AlwaysBreakTemplateDeclarations: Yes
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 200
+
+BreakBeforeBraces: Custom
+BreakAdjacentStringLiterals: false
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterExternBlock: false
+  AfterFunction: false
+  AfterStruct: false
+  AfterNamespace: false
+  AfterUnion: false
+  BeforeCatch: true
+  BeforeElse: true
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+  IndentBraces: false
+
+SortIncludes: false
+SortUsingDeclarations: true
+
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: true
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 1
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+BinPackArguments: true
+BinPackParameters: true
+# Requires clang-format 22+; older versions will error on unknown keys below.
+BinPackLongBracedList: true
+BreakBeforeCloseBracketBracedList: false
+PenaltyBreakBeforeFirstCallParameter: 1
+
+# Align consecutive macro definitions, which keeps the HIP compatibility block readable.
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# Preprocessor directive indentation: None (flat), AfterHash (#  if), BeforeHash (  #if)
+IndentPPDirectives: None
+
+# C++ convention `int* x`, rather than the C-idiomatic `int *x`.
 PointerAlignment: Left
-AllowShortCaseLabelsOnASingleLine: True
+DerivePointerAlignment: false
+
+# Preserve user line breaks in intrinsic-heavy code
+BreakBeforeBinaryOperators: None
+PenaltyBreakAssignment: 50
+
+# Ensure files end with a newline
+InsertNewlineAtEOF: true

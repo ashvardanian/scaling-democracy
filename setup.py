@@ -1,12 +1,13 @@
 import os
-import shutil
-from setuptools import setup
-from setuptools.extension import Extension
-from setuptools.command.build_ext import build_ext
 import platform
+import shutil
+import sys
 import sysconfig
 
 import pybind11
+from setuptools import setup
+from setuptools.command.build_ext import build_ext
+from setuptools.extension import Extension
 
 
 def cuda_home():
@@ -27,9 +28,7 @@ def has_cuda():
     if os.system("which nvcc > /dev/null 2>&1") != 0:
         return False
     # Check for CUDA headers
-    if not os.path.exists(os.path.join(CUDA_HOME, "include", "cuda.h")):
-        return False
-    return True
+    return os.path.exists(os.path.join(CUDA_HOME, "include", "cuda.h"))
 
 
 # Detect ROCm/HIP availability
@@ -43,9 +42,7 @@ def has_rocm():
         "/opt/rocm/include/hip/hip_runtime.h",
         "/opt/rocm/hip/include/hip/hip_runtime.h",
     ]
-    if not any(os.path.exists(path) for path in hip_paths):
-        return False
-    return True
+    return any(os.path.exists(path) for path in hip_paths)
 
 
 # Ampere, Ada, Hopper, Blackwell datacenter, Blackwell consumer. Newest last: it supplies the PTX.
@@ -288,12 +285,8 @@ __version__ = "0.2.0"
 
 long_description = ""
 this_directory = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f:
+with open(os.path.join(this_directory, "README.md"), encoding="utf-8") as f:
     long_description = f.read()
-
-# Get Python library path dynamically
-import sys
-import sysconfig
 
 # Try to get the actual Python library directory
 # Use sysconfig which is more reliable than sys.prefix for finding libraries
@@ -368,7 +361,7 @@ elif rocm_available:
             ],
             extra_link_args=[
                 f"-Wl,-rpath,{python_lib_dir}",
-                f"-Wl,-rpath,/opt/rocm/lib",
+                "-Wl,-rpath,/opt/rocm/lib",
                 "-fopenmp",
             ],
             language="c++",

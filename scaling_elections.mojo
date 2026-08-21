@@ -12,17 +12,17 @@ Run directly with Mojo via Pixi:
 
 ```bash
 pixi run mojo scaling_elections.mojo
-pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 4096 --run-cpu --run-gpu
+pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 4096
 ```
 
 For proper benchmarking with large random-generated preference matrices:
 
 ```bash
-pixi run mojo scaling_elections.mojo --num-candidates 2048 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 20
-pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 10
-pixi run mojo scaling_elections.mojo --num-candidates 8192 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 5
-pixi run mojo scaling_elections.mojo --num-candidates 16384 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 3
-pixi run mojo scaling_elections.mojo --num-candidates 32768 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 1
+pixi run mojo scaling_elections.mojo --num-candidates 2048 --num-voters 0 -k GPU --warmup 1 --repeat 20
+pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 0 -k GPU --warmup 1 --repeat 10
+pixi run mojo scaling_elections.mojo --num-candidates 8192 --num-voters 0 -k GPU --warmup 1 --repeat 5
+pixi run mojo scaling_elections.mojo --num-candidates 16384 --num-voters 0 -k GPU --warmup 1 --repeat 3
+pixi run mojo scaling_elections.mojo --num-candidates 32768 --num-voters 0 -k GPU --warmup 1 --repeat 1
 ```
 
 Or compile and run:
@@ -45,8 +45,8 @@ from std.memory import (
     stack_allocation,
     unsafe_memset_zero,
 )
-from std.random import random_si64
-from std.sys import argv, has_accelerator
+from std.random import random_si64, seed
+from std.sys import argv, exit, has_accelerator
 from std.time import perf_counter_ns
 from max.algorithm import parallelize
 from max.gpu import barrier
@@ -60,8 +60,27 @@ from max.gpu.host import DeviceContext
 # ! Pre-compiled variants allow runtime selection without JIT overhead.
 comptime DEFAULT_CPU_TILE_SIZE = 32
 comptime DEFAULT_GPU_TILE_SIZE = 32
-comptime ALLOWED_CPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)
-comptime ALLOWED_GPU_TILE_SIZES = (4, 8, 12, 16, 24, 32)
+comptime ALLOWED_CPU_TILE_SIZES = (4, 8, 16, 32, 64, 128)
+comptime ALLOWED_GPU_TILE_SIZES = (4, 8, 16, 32)
+
+
+@fieldwise_init
+struct TilePhase(Copyable, Equatable, Movable):
+    """Which tile phase a processor runs, fixing aliasing and diagonal handling together.
+
+    The three states are the only combinations the recurrence produces.
+    """
+
+    var value: UInt8
+    comptime aliased = Self(0)
+    comptime distinct_diagonal = Self(1)
+    comptime distinct_independent = Self(2)
+
+    def __eq__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+    def __ne__(self, other: Self) -> Bool:
+        return self.value != other.value
 
 
 @fieldwise_init
@@ -320,15 +339,6 @@ def process_tile_cpu[
 
                 if new_val > c_val:
                     c[unsafe_offset=c_idx] = new_val
-
-
-# =============================================================================
-# SIMD-VECTORIZED CPU TILE PROCESSORS FOR SCHULZE VOTING ALGORITHM
-# =============================================================================
-#
-# Three-phase specialized tile processors using SIMD for vectorization
-# Mirrors GPU's phase-specific design but uses SIMD vectors instead of threads
-# =============================================================================
 
 
 def process_tile_cpu_simd_independent[
@@ -1175,15 +1185,12 @@ def run_warmup[
         var elapsed_ns = perf_counter_ns() - start_time
         if warmup > 1:
             print(
-                "  Warm-up "
-                + String(i + 1)
-                + "/"
-                + String(warmup)
-                + ": "
-                + format_time(elapsed_ns)
+                "  Warm-up {}/{}: {}".format(
+                    i + 1, warmup, format_time(elapsed_ns)
+                )
             )
         else:
-            print("  Warm-up: " + format_time(elapsed_ns))
+            print("  Warm-up: {}".format(format_time(elapsed_ns)))
 
 
 def measure_and_average[
@@ -1216,88 +1223,83 @@ def profile_and_report[
     warmup: Int,
     repeat: Int,
     num_candidates: Int,
-    has_baseline: Bool,
-    baseline: StrongestPathsMatrix,
-) raises -> Tuple[Bool, Int, List[Int]]:
-    """
-    Profile an implementation's performance and report results with validation.
-    Returns (success, winner_idx, ranking) tuple.
-    """
-    print("→ " + label)
+    mut baseline: StrongestPathsMatrix,
+    mut has_baseline: Bool,
+) raises -> Tuple[Int, List[Int]]:
+    """Times one implementation, adopting the first result as the baseline.
 
-    # Warmup
+    Returns the winner and the full ranking.
+    """
+    print("→ {}".format(label))
+
     run_warmup[implementation](preferences, warmup)
 
-    # Benchmark
     var result = StrongestPathsMatrix(0)
     var avg_time = measure_and_average[implementation](
         preferences, repeat, result
     )
 
-    # Print results
     if repeat > 1:
         print(
-            "  Run:     "
-            + format_time(avg_time)
-            + " (avg of "
-            + String(repeat)
-            + ") │ "
-            + format_throughput_from_ns(avg_time, num_candidates)
+            "  Run:     {} (avg of {}) │ {}".format(
+                format_time(avg_time),
+                repeat,
+                format_throughput_from_ns(avg_time, num_candidates),
+            )
         )
     else:
         print(
-            "  Run:     "
-            + format_time(avg_time)
-            + " │ "
-            + format_throughput_from_ns(avg_time, num_candidates)
+            "  Run:     {} │ {}".format(
+                format_time(avg_time),
+                format_throughput_from_ns(avg_time, num_candidates),
+            )
         )
 
-    # Validate
-    if has_baseline and validate_against_baseline(result, baseline):
-        print("  ✓ Results validated")
-    elif has_baseline:
-        print("  ✗ Results don't match baseline!")
+    if has_baseline:
+        if validate_against_baseline(result, baseline):
+            print("  ✓ Results validated")
+        else:
+            print("  ✗ Results don't match baseline!")
 
-    # Extract winner
     var result_tuple = compute_election_results(result)
     var winner_idx = result_tuple[0]
     var winner_ranking = result_tuple[1].copy()
 
+    if not has_baseline:
+        baseline = result^
+        has_baseline = True
+
     print()
-    return (True, winner_idx, winner_ranking^)
+    return (winner_idx, winner_ranking^)
 
 
 def format_time(elapsed_ns: Int) -> String:
     """Format time with appropriate unit (ms or s)."""
     var elapsed_ms = elapsed_ns // 1_000_000
     if elapsed_ms < 1000:
-        return String(elapsed_ms) + " ms"
+        return "{} ms".format(elapsed_ms)
     else:
         var elapsed_sec = Float64(elapsed_ns) / 1_000_000_000.0
         var sec_x100 = Int(elapsed_sec * 100.0)
-        return (
-            String(sec_x100 // 100)
-            + "."
-            + String((sec_x100 % 100) // 10)
-            + String(sec_x100 % 10)
-            + " s"
+        return "{}.{}{} s".format(
+            sec_x100 // 100, (sec_x100 % 100) // 10, sec_x100 % 10
         )
 
 
 def format_throughput(cells_per_sec: Float64) -> String:
-    """Format throughput with appropriate unit (T/G/M cells³/s)."""
+    """Format throughput with appropriate unit (T/G/M cells/s)."""
     if cells_per_sec >= 1e12:
         var t_x10 = Int(cells_per_sec / 1e11)
-        return String(t_x10 // 10) + "." + String(t_x10 % 10) + " Tcells³/s"
+        return "{}.{} Tcells/s".format(t_x10 // 10, t_x10 % 10)
     elif cells_per_sec >= 1e9:
         var g_x10 = Int(cells_per_sec / 1e8)
-        return String(g_x10 // 10) + "." + String(g_x10 % 10) + " Gcells³/s"
+        return "{}.{} Gcells/s".format(g_x10 // 10, g_x10 % 10)
     elif cells_per_sec >= 1e6:
         var m_x10 = Int(cells_per_sec / 1e5)
-        return String(m_x10 // 10) + "." + String(m_x10 % 10) + " Mcells³/s"
+        return "{}.{} Mcells/s".format(m_x10 // 10, m_x10 % 10)
     else:
         var k_x10 = Int(cells_per_sec / 1e2)
-        return String(k_x10 // 10) + "." + String(k_x10 % 10) + " Kcells³/s"
+        return "{}.{} Kcells/s".format(k_x10 // 10, k_x10 % 10)
 
 
 def format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
@@ -1313,14 +1315,6 @@ def format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
     return format_throughput(cells_per_sec)
 
 
-# =============================================================================
-# PURE MOJO GPU KERNELS FOR SCHULZE VOTING ALGORITHM
-# =============================================================================
-#
-# Implementation of three-phase tiled Floyd-Warshall algorithm on GPU
-# Matching the CUDA reference in scaling_elections.cu
-# =============================================================================
-
 # endregion Benchmarking
 
 # region GPU Kernels
@@ -1332,7 +1326,7 @@ comptime SharedUInt32Ptr = Pointer[
 
 @always_inline
 def process_tile_gpu_device[
-    tile_size: Int, may_be_diagonal: Bool, synchronize: Bool
+    tile_size: Int, phase: TilePhase
 ](
     c_shared: SharedUInt32Ptr,
     a_shared: SharedUInt32Ptr,
@@ -1368,7 +1362,7 @@ def process_tile_gpu_device[
         var b_val = b_shared[unsafe_offset=b_idx]
         var smallest = min(a_val, b_val)
 
-        comptime if may_be_diagonal:
+        comptime if phase != TilePhase.distinct_independent:
             # Compute global indices
             var global_i = c_row + bi
             var global_j = c_col + bj
@@ -1402,8 +1396,7 @@ def process_tile_gpu_device[
         # threads must see updated values from previous k iterations.
         c_shared[unsafe_offset=c_idx] = c_val
 
-        # Synchronize after each k iteration when needed (for diagonal/shared tiles)
-        comptime if synchronize:
+        comptime if phase == TilePhase.aliased:
             barrier()
 
 
@@ -1435,7 +1428,7 @@ def gpu_diagonal_kernel[
     barrier()
 
     # Process tile (all three inputs are the same tile, need synchronization)
-    process_tile_gpu_device[tile_size, True, True](
+    process_tile_gpu_device[tile_size, TilePhase.aliased](
         c_shared,
         c_shared,
         c_shared,
@@ -1501,7 +1494,7 @@ def gpu_partially_independent_kernel[
 
     barrier()
 
-    process_tile_gpu_device[tile_size, True, True](
+    process_tile_gpu_device[tile_size, TilePhase.aliased](
         c_shared,
         c_shared,
         b_shared,
@@ -1531,7 +1524,7 @@ def gpu_partially_independent_kernel[
 
     barrier()
 
-    process_tile_gpu_device[tile_size, True, True](
+    process_tile_gpu_device[tile_size, TilePhase.aliased](
         c_shared,
         a_shared,
         c_shared,
@@ -1600,7 +1593,7 @@ def gpu_independent_kernel[
 
     # Process tile - use diagonal check if i == j, no synchronization needed (different tiles)
     if i == j:
-        process_tile_gpu_device[tile_size, True, False](
+        process_tile_gpu_device[tile_size, TilePhase.distinct_diagonal](
             c_shared,
             a_shared,
             b_shared,
@@ -1612,7 +1605,7 @@ def gpu_independent_kernel[
             j * tile_size,
         )
     else:
-        process_tile_gpu_device[tile_size, False, False](
+        process_tile_gpu_device[tile_size, TilePhase.distinct_independent](
             c_shared,
             a_shared,
             b_shared,
@@ -1741,6 +1734,36 @@ def compute_strongest_paths_gpu[
 # region Command Line
 
 
+def run_tiled_backend[
+    family: def[tile_size: Int](
+        PreferenceMatrix
+    ) raises thin -> StrongestPathsMatrix,
+    *sizes: Int,
+](
+    label: String,
+    tile_size: Int,
+    preferences: PreferenceMatrix,
+    warmup: Int,
+    repeat: Int,
+    num_candidates: Int,
+    mut baseline: StrongestPathsMatrix,
+    mut has_baseline: Bool,
+) raises -> Tuple[Int, List[Int]]:
+    """Lowers a runtime tile size onto the set this family instantiates."""
+    comptime for tile in sizes:
+        if tile_size == tile:
+            return profile_and_report[family[tile]](
+                label,
+                preferences,
+                warmup,
+                repeat,
+                num_candidates,
+                baseline,
+                has_baseline,
+            )
+    raise Error(String("Unsupported tile size: ", tile_size))
+
+
 def validate_against_baseline(
     result: StrongestPathsMatrix, baseline: StrongestPathsMatrix
 ) -> Bool:
@@ -1755,21 +1778,36 @@ def validate_against_baseline(
 
 def parse_int_arg(
     args: Span[StaticString, ImmStaticOrigin], flag: String, default: Int
-) -> Int:
-    """Parse an integer command-line argument."""
+) raises -> Int:
+    """Parse an integer command-line argument, raising if it is malformed."""
     for i in range(len(args)):
-        if String(args[i]) == flag and i + 1 < len(args):
-            try:
-                return Int(String(args[i + 1]))
-            except:
-                print(
-                    "Warning: Invalid value for",
-                    flag,
-                    "- using default:",
-                    default,
-                )
-                return default
+        if String(args[i]) != flag:
+            continue
+        if i + 1 >= len(args):
+            raise Error(String(flag, " needs a value"))
+        try:
+            return Int(String(args[i + 1]))
+        except:
+            raise Error(String("Invalid value for ", flag, ": ", args[i + 1]))
     return default
+
+
+def parse_text_arg(
+    args: Span[StaticString, ImmStaticOrigin], flag: String, default: String
+) raises -> String:
+    """Parse a string argument, raising when its value is missing."""
+    for i in range(len(args)):
+        if String(args[i]) != flag:
+            continue
+        if i + 1 >= len(args):
+            raise Error(String(flag, " needs a value"))
+        return String(args[i + 1])
+    return default
+
+
+def selected_by(pattern: String, name: String) -> Bool:
+    """Whether a backend name matches the selector, case-insensitively."""
+    return pattern == "." or pattern.lower() in name.lower()
 
 
 def has_flag(args: Span[StaticString, ImmStaticOrigin], flag: String) -> Bool:
@@ -1780,308 +1818,268 @@ def has_flag(args: Span[StaticString, ImmStaticOrigin], flag: String) -> Bool:
     return False
 
 
+def reject_unknown_flags(
+    args: Span[StaticString, ImmStaticOrigin],
+) raises:
+    """Rejects unrecognized flags, so a typo cannot silently use defaults."""
+    comptime valued = (
+        "--num-candidates",
+        "--num-voters",
+        "--cpu-tile-size",
+        "--gpu-tile-size",
+        "--warmup",
+        "--repeat",
+        "--seed",
+        "--filter",
+        "-k",
+    )
+    comptime bare = ("--help", "-h")
+    var i = 1
+    while i < len(args):
+        var argument = String(args[i])
+        var matched = False
+
+        comptime for slot in range(len(valued)):
+            if not matched and argument == valued[slot]:
+                matched = True
+                i += 1
+
+        comptime for slot in range(len(bare)):
+            if argument == bare[slot]:
+                matched = True
+
+        if not matched:
+            raise Error(String("Unknown option: ", argument))
+        i += 1
+
+
 def print_usage():
     """Print usage information."""
-    print("Usage: mojo scaling_elections.mojo [OPTIONS]")
-    print()
-    print("Options:")
-    print("  --num-candidates N    Number of candidates (default: 128)")
-    print("  --num-voters N        Number of voters (default: 2000)")
+    var cpu_sizes = String("")
+    comptime for i in range(len(ALLOWED_CPU_TILE_SIZES)):
+        if i > 0:
+            cpu_sizes += ", "
+        cpu_sizes += String(ALLOWED_CPU_TILE_SIZES[i])
+    var gpu_sizes = String("")
+    comptime for i in range(len(ALLOWED_GPU_TILE_SIZES)):
+        if i > 0:
+            gpu_sizes += ", "
+        gpu_sizes += String(ALLOWED_GPU_TILE_SIZES[i])
+
     print(
-        "                        Set to 0 for instant random preference matrix"
-        " generation"
+        """Usage: mojo scaling_elections.mojo [OPTIONS]
+
+Options:
+  --num-candidates N    Number of candidates (default: 128)
+  --num-voters N        Number of voters (default: 2000)
+                        Set to 0 for instant random preference matrix generation
+  -k, --filter TEXT     Select backends whose name contains TEXT, case-insensitively
+                        Names: Serial (Mojo), Tiled CPU (Mojo), Tiled CPU+SIMD (Mojo), Tiled GPU (Mojo)
+  --cpu-tile-size N     CPU tile size: {} (default: {})
+  --gpu-tile-size N     GPU tile size: {} (default: {})
+  --warmup N            Number of warmup iterations (default: 1)
+  --repeat N            Number of benchmark iterations (default: 1)
+  --seed N              Seed for the preference generator (default: 42)
+  --help, -h            Show this help message
+
+Examples:
+  pixi run mojo scaling_elections.mojo --num-candidates 256 --num-voters 4000
+  pixi run mojo scaling_elections.mojo --num-candidates 4096 -k GPU
+  pixi run mojo scaling_elections.mojo --num-candidates 16384 --num-voters 0 -k 'Tiled CPU'""".format(
+            cpu_sizes,
+            DEFAULT_CPU_TILE_SIZE,
+            gpu_sizes,
+            DEFAULT_GPU_TILE_SIZE,
+        )
     )
-    print(
-        "  --run-cpu             Run CPU implementations (tiled +"
-        " SIMD-vectorized)"
-    )
-    print("  --run-gpu             Run GPU implementation")
-    print("  --no-serial           Skip serial baseline")
-    print(
-        "  --cpu-tile-size N     CPU tile size: 4, 8, 12, 16, 24, 32, 48, 64,"
-        " 96, 128 (default: 16)"
-    )
-    print(
-        "  --gpu-tile-size N     GPU tile size: 4, 8, 12, 16, 24, 32"
-        " (default: 32)"
-    )
-    print("  --warmup N            Number of warmup iterations (default: 1)")
-    print("  --repeat N            Number of benchmark iterations (default: 1)")
-    print("  --help, -h            Show this help message")
-    print()
-    print("Examples:")
-    print(
-        "  pixi run mojo scaling_elections.mojo --num-candidates 256"
-        " --num-voters 4000"
-    )
-    print(
-        "  pixi run mojo scaling_elections.mojo --num-candidates 4096 --run-cpu"
-        " --run-gpu"
-    )
-    print(
-        "  pixi run mojo scaling_elections.mojo --num-candidates 16384"
-        " --num-voters 0 --run-gpu --no-serial"
-    )
-    print("  pixi run mojo scaling_elections.mojo --run-cpu --cpu-tile-size 32")
 
 
 def main():
-    """
-    Main function demonstrating the Schulze voting algorithm.
-    Tests CPU and GPU implementations with performance benchmarking.
-    Supports command-line arguments for configuration.
-    """
+    """Benchmarks the selected backends and reports the election."""
     var args = argv()
 
     # Check for help flag
     if has_flag(args, "--help") or has_flag(args, "-h"):
         print_usage()
         return
+    var num_candidates = 128
+    var num_voters = 2000
+    var cpu_tile_size = DEFAULT_CPU_TILE_SIZE
+    var gpu_tile_size = DEFAULT_GPU_TILE_SIZE
+    var warmup = 1
+    var repeat = 1
+    var seed_value = 42
+    var selector = String(".")
+    try:
+        reject_unknown_flags(args)
+        num_candidates = parse_int_arg(args, "--num-candidates", num_candidates)
+        num_voters = parse_int_arg(args, "--num-voters", num_voters)
+        cpu_tile_size = parse_int_arg(args, "--cpu-tile-size", cpu_tile_size)
+        gpu_tile_size = parse_int_arg(args, "--gpu-tile-size", gpu_tile_size)
+        warmup = parse_int_arg(args, "--warmup", warmup)
+        repeat = parse_int_arg(args, "--repeat", repeat)
+        seed_value = parse_int_arg(args, "--seed", seed_value)
+        selector = parse_text_arg(args, "--filter", selector)
+        selector = parse_text_arg(args, "-k", selector)
+        if cpu_tile_size not in ALLOWED_CPU_TILE_SIZES:
+            raise Error("--cpu-tile-size must be 4, 8, 16, 32, 64, or 128")
+        if gpu_tile_size not in ALLOWED_GPU_TILE_SIZES:
+            raise Error("--gpu-tile-size must be 4, 8, 16, or 32")
+        if num_candidates < 4:
+            raise Error("--num-candidates must be at least 4")
+        if num_voters < 0:
+            raise Error("--num-voters cannot be negative")
+        if warmup < 0:
+            raise Error("--warmup cannot be negative")
+        if repeat < 1:
+            raise Error("--repeat must be at least 1")
+    except error:
+        print("Error:", error)
+        print()
+        print_usage()
+        exit(2)
 
-    # Parse command-line arguments
-    var num_candidates = parse_int_arg(args, "--num-candidates", 128)
-    var num_voters = parse_int_arg(args, "--num-voters", 2000)
-    var cpu_tile_size = parse_int_arg(
-        args, "--cpu-tile-size", DEFAULT_CPU_TILE_SIZE
-    )
-    var gpu_tile_size = parse_int_arg(
-        args, "--gpu-tile-size", DEFAULT_GPU_TILE_SIZE
-    )
-    var warmup = parse_int_arg(args, "--warmup", 1)
-    var repeat = parse_int_arg(args, "--repeat", 1)
-    var run_cpu = has_flag(args, "--run-cpu")
-    var run_gpu = has_flag(args, "--run-gpu")
-    var no_serial = has_flag(args, "--no-serial")
-    var run_serial = not no_serial
-
-    # Detect GPU availability
-    print("=== Schulze Voting Algorithm (Mojo) ===")
+    print("Schulze Voting Algorithm (Mojo)")
     print()
 
-    if run_gpu:
-        if not has_accelerator():
-            print("✗ No GPU detected - GPU mode disabled")
-            run_gpu = False
-
-    # Validate CPU tile size
-    if cpu_tile_size not in ALLOWED_CPU_TILE_SIZES:
-        print(
-            (
-                "Warning: --cpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, 64,"
-                " 96, or 128. Using default:"
-            ),
-            DEFAULT_CPU_TILE_SIZE,
-        )
-        cpu_tile_size = DEFAULT_CPU_TILE_SIZE
+    comptime serial_label = "Serial (Mojo)"
+    comptime cpu_label = "Tiled CPU (Mojo)"
+    comptime simd_label = "Tiled CPU+SIMD (Mojo)"
+    comptime gpu_label = "Tiled GPU (Mojo)"
+    var wants_gpu = selected_by(selector, gpu_label)
+    if wants_gpu and not has_accelerator():
+        print("✗ No GPU detected, so {} is skipped".format(gpu_label))
         print()
-
-    # Validate GPU tile size
-    if run_gpu and gpu_tile_size not in ALLOWED_GPU_TILE_SIZES:
-        print(
-            (
-                "Warning: --gpu-tile-size must be 4, 8, 12, 16, 24, or 32."
-                " Using default:"
-            ),
-            DEFAULT_GPU_TILE_SIZE,
-        )
-        gpu_tile_size = DEFAULT_GPU_TILE_SIZE
-        print()
-
-    # Validate candidates (must be at least 4)
-    if num_candidates < 4:
-        print("Error: num_candidates must be at least 4")
-        return
+        wants_gpu = False
 
     print("Configuration:")
-    var voters_str = (
-        String(num_voters) + " voters" if num_voters > 0 else "random"
-    )
+    var voters_str = "{} voters".format(
+        num_voters
+    ) if num_voters > 0 else String("random")
     print(
-        "  Problem size: "
-        + String(num_candidates)
-        + " candidates × "
-        + voters_str
+        "  Problem size: {} candidates × {}".format(num_candidates, voters_str)
     )
-    print(
-        "  CPU tile: " + String(cpu_tile_size) + " × " + String(cpu_tile_size)
-    )
-    if run_gpu:
-        print(
-            "  GPU tile: "
-            + String(gpu_tile_size)
-            + " × "
-            + String(gpu_tile_size)
-        )
-    print("  Warmup: " + String(warmup) + ", Repeat: " + String(repeat))
+    print("  CPU tile: {} × {}".format(cpu_tile_size, cpu_tile_size))
+    print("  GPU tile: {} × {}".format(gpu_tile_size, gpu_tile_size))
+    print("  Warmup: {}, Repeat: {}".format(warmup, repeat))
     print()
 
     print("Generating preferences...")
+    seed(seed_value)
     var preferences = generate_random_preferences(num_candidates, num_voters)
 
     # Benchmarking section
     print()
-    print("─── Benchmarking ───────────────────────────────────")
+    print("Benchmarking")
     print()
 
-    # Store baseline for validation
+    # The first backend that succeeds becomes the baseline the rest validate against.
     var baseline = StrongestPathsMatrix(0)
     var has_baseline = False
-
-    # Store winner info
     var winner = 0
     var ranking = List[Int]()
     var has_winner = False
 
-    # Run serial baseline (unless --no-serial)
-    if run_serial:
+    if selected_by(selector, serial_label):
         try:
-            print("→ Serial (Mojo)")
-            run_warmup[compute_strongest_paths_serial](preferences, warmup)
-
-            var avg_time = measure_and_average[compute_strongest_paths_serial](
-                preferences, repeat, baseline
+            var outcome = profile_and_report[compute_strongest_paths_serial](
+                serial_label,
+                preferences,
+                warmup,
+                repeat,
+                num_candidates,
+                baseline,
+                has_baseline,
             )
-
-            if repeat > 1:
-                print(
-                    "  Run:     "
-                    + format_time(avg_time)
-                    + " (avg of "
-                    + String(repeat)
-                    + ") │ "
-                    + format_throughput_from_ns(avg_time, num_candidates)
-                )
-            else:
-                print(
-                    "  Run:     "
-                    + format_time(avg_time)
-                    + " │ "
-                    + format_throughput_from_ns(avg_time, num_candidates)
-                )
-
-            has_baseline = True
-            var result_tuple = compute_election_results(baseline)
-            winner = result_tuple[0]
-            ranking = result_tuple[1].copy()
-            has_winner = True
-            print()
+            if not has_winner:
+                winner = outcome[0]
+                ranking = outcome[1].copy()
+                has_winner = True
         except e:
-            print("  ✗ Serial failed: " + String(e))
+            print("  ✗ {} failed: {}".format(serial_label, e))
             print()
 
-    # Run CPU implementation - dispatch to correct tile size
-    if run_cpu:
+    if selected_by(selector, cpu_label):
         try:
-            # TODO: Rewrite it once `Tuple.__iter__` is supported
-            comptime for i in range(len(ALLOWED_CPU_TILE_SIZES)):
-                comptime tile_size = ALLOWED_CPU_TILE_SIZES[i]
-                if cpu_tile_size != tile_size:
-                    continue
-
-                var result_tuple = profile_and_report[
-                    compute_strongest_paths_tiled_cpu[tile_size]
-                ](
-                    "Tiled CPU (Mojo)",
-                    preferences,
-                    warmup,
-                    repeat,
-                    num_candidates,
-                    has_baseline,
-                    baseline,
-                )
-                if not has_winner:
-                    winner = result_tuple[1]
-                    ranking = result_tuple[2].copy()
-                    has_winner = True
+            var outcome = run_tiled_backend[
+                compute_strongest_paths_tiled_cpu, 4, 8, 16, 32, 64, 128
+            ](
+                cpu_label,
+                cpu_tile_size,
+                preferences,
+                warmup,
+                repeat,
+                num_candidates,
+                baseline,
+                has_baseline,
+            )
+            if not has_winner:
+                winner = outcome[0]
+                ranking = outcome[1].copy()
+                has_winner = True
         except e:
-            print("  ✗ CPU failed: " + String(e))
+            print("  ✗ {} failed: {}".format(cpu_label, e))
             print()
 
-    # Run SIMD CPU implementation
-    if run_cpu:
+    if selected_by(selector, simd_label):
         try:
-            # TODO: Rewrite it once `Tuple.__iter__` is supported
-            comptime for i in range(len(ALLOWED_CPU_TILE_SIZES)):
-                comptime tile_size = ALLOWED_CPU_TILE_SIZES[i]
-                if cpu_tile_size != tile_size:
-                    continue
-
-                var result_tuple = profile_and_report[
-                    compute_strongest_paths_tiled_cpu_simd[tile_size]
-                ](
-                    "Tiled CPU+SIMD (Mojo)",
-                    preferences,
-                    warmup,
-                    repeat,
-                    num_candidates,
-                    has_baseline,
-                    baseline,
-                )
-                if not has_winner:
-                    winner = result_tuple[1]
-                    ranking = result_tuple[2].copy()
-                    has_winner = True
+            var outcome = run_tiled_backend[
+                compute_strongest_paths_tiled_cpu_simd, 4, 8, 16, 32, 64, 128
+            ](
+                simd_label,
+                cpu_tile_size,
+                preferences,
+                warmup,
+                repeat,
+                num_candidates,
+                baseline,
+                has_baseline,
+            )
+            if not has_winner:
+                winner = outcome[0]
+                ranking = outcome[1].copy()
+                has_winner = True
         except e:
-            print("  ✗ CPU+SIMD failed: " + String(e))
+            print("  ✗ {} failed: {}".format(simd_label, e))
             print()
 
-    # Run GPU implementation - dispatch to correct tile size
-    if run_gpu:
+    if wants_gpu:
         try:
-            # TODO: Rewrite it once `Tuple.__iter__` is supported
-            comptime for i in range(len(ALLOWED_GPU_TILE_SIZES)):
-                comptime tile_size = ALLOWED_GPU_TILE_SIZES[i]
-                if gpu_tile_size != tile_size:
-                    continue
-
-                var result_tuple = profile_and_report[
-                    compute_strongest_paths_gpu[tile_size]
-                ](
-                    "Tiled GPU (Mojo)",
-                    preferences,
-                    warmup,
-                    repeat,
-                    num_candidates,
-                    has_baseline,
-                    baseline,
-                )
-                if not has_winner:
-                    winner = result_tuple[1]
-                    ranking = result_tuple[2].copy()
-                    has_winner = True
+            var outcome = run_tiled_backend[
+                compute_strongest_paths_gpu, 4, 8, 16, 32
+            ](
+                gpu_label,
+                gpu_tile_size,
+                preferences,
+                warmup,
+                repeat,
+                num_candidates,
+                baseline,
+                has_baseline,
+            )
+            if not has_winner:
+                winner = outcome[0]
+                ranking = outcome[1].copy()
+                has_winner = True
         except e:
-            print("  ✗ GPU failed: " + String(e))
+            print("  ✗ {} failed: {}".format(gpu_label, e))
             print()
-
-    # Compute fallback if no results
-    if not has_winner:
-        try:
-            var fallback = compute_strongest_paths_serial(preferences)
-            var result_tuple = compute_election_results(fallback)
-            winner = result_tuple[0]
-            ranking = result_tuple[1].copy()
-        except e:
-            print("  ✗ Failed to compute results: " + String(e))
-            return
 
     # Display election results
-    print("─── Election Results ───────────────────────────────")
+    print("Election Results")
     print()
-    print("  Winner: Candidate #" + String(winner))
-    if num_candidates >= 5:
-        print(
-            "  Top 5:  #"
-            + String(ranking[0])
-            + ", #"
-            + String(ranking[1])
-            + ", #"
-            + String(ranking[2])
-            + ", #"
-            + String(ranking[3])
-            + ", #"
-            + String(ranking[4])
-        )
+    if not has_winner:
+        print("  No implementation was run, so there is no ranking to report.")
+        print()
+        return
 
+    print("  Winner: Candidate #{}".format(winner))
+    var shown = String("")
+    for i in range(min(5, len(ranking))):
+        if i > 0:
+            shown += ", "
+        shown += "#{}".format(ranking[i])
+    print("  Top {}:  {}".format(min(5, len(ranking)), shown))
     print()
 
 

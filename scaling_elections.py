@@ -9,26 +9,31 @@ algorithm with block-parallel optimizations.
 Usage:
     uv run scaling_elections.py
     uv run scaling_elections.py --help
-    uv run scaling_elections.py --num-candidates 4096 --num-voters 4096 --run-cpu --run-gpu
+    uv run scaling_elections.py --num-candidates 4096 --num-voters 4096
 
-For proper benchmarking with large random-generated preference matrices:
-    uv run scaling_elections.py --num-candidates 2048 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 20
-    uv run scaling_elections.py --num-candidates 4096 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 10
-    uv run scaling_elections.py --num-candidates 8192 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 5
-    uv run scaling_elections.py --num-candidates 16384 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 3
-    uv run scaling_elections.py --num-candidates 32768 --num-voters 0 --run-gpu --no-serial --warmup 1 --repeat 1
+Backends are selected by regex against their names, so `-k GPU` runs both GPU rows and
+`-k Hopper` runs only the bulk-tensor one:
+    uv run scaling_elections.py --num-candidates 2048 --num-voters 0 -k GPU --warmup 1 --repeat 20
+    uv run scaling_elections.py --num-candidates 4096 --num-voters 0 -k GPU --warmup 1 --repeat 10
+    uv run scaling_elections.py --num-candidates 8192 --num-voters 0 -k GPU --warmup 1 --repeat 5
+    uv run scaling_elections.py --num-candidates 16384 --num-voters 0 -k GPU --warmup 1 --repeat 3
+    uv run scaling_elections.py --num-candidates 32768 --num-voters 0 -k GPU --warmup 1 --repeat 1
 
 See: https://github.com/ashvardanian/ScalingElections
 """
 
-from typing import Sequence, Tuple, List
+import re
+import time
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
-from numba import njit, prange, get_num_threads
+from numba import get_num_threads, njit, prange
 
-from scaling_elections import log_gpus  # type: ignore
-from scaling_elections import compute_strongest_paths  # type: ignore
+from scaling_elections import (
+    compute_strongest_paths,  # type: ignore
+    log_gpus,  # type: ignore
+)
 
 # Suppress Numba TBB threading layer warnings
 warnings.filterwarnings("ignore", message=".*TBB threading layer.*")
@@ -70,7 +75,6 @@ def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarr
 
     # Process each voter's ranking
     for ranking in voter_rankings:
-
         # We may be dealing with incomplete rankings
         if len(ranking) != count_candidates:
             # Create a mask for integers from 0 to N
@@ -156,11 +160,7 @@ def compute_strongest_paths_tile_numba(
     for k in range(k_extent):
         for i in range(i_extent):
             for j in range(j_extent):
-                if (
-                    (c_row + i != c_col + j)
-                    and (a_row + i != a_col + k)
-                    and (b_row + k != b_col + j)
-                ):
+                if (c_row + i != c_col + j) and (a_row + i != a_col + k) and (b_row + k != b_col + j):
                     replacement = min(a[a_row + i, a_col + k], b[b_row + k, b_col + j])
                     if replacement > c[c_row + i, c_col + j]:
                         c[c_row + i, c_col + j] = replacement
@@ -281,7 +281,7 @@ def compute_strongest_paths_numba_parallel(
 def get_winner_and_ranking(
     candidates: list,
     strongest_paths: np.ndarray,
-) -> Tuple[int, List[int]]:
+) -> tuple[int, list[int]]:
     """
     Determines the winner and the overall ranking of candidates based on the strongest paths matrix.
 
@@ -313,15 +313,15 @@ def format_time(elapsed_sec: float) -> str:
 
 
 def format_throughput(cells_per_sec: float) -> str:
-    """Format throughput with appropriate unit (T/G/M cells³/s)."""
+    """Format throughput with appropriate unit (T/G/M cells/s)."""
     if cells_per_sec >= 1e12:
-        return f"{cells_per_sec / 1e12:.1f} Tcells³/s"
+        return f"{cells_per_sec / 1e12:.1f} Tcells/s"
     elif cells_per_sec >= 1e9:
-        return f"{cells_per_sec / 1e9:.1f} Gcells³/s"
+        return f"{cells_per_sec / 1e9:.1f} Gcells/s"
     elif cells_per_sec >= 1e6:
-        return f"{cells_per_sec / 1e6:.1f} Mcells³/s"
+        return f"{cells_per_sec / 1e6:.1f} Mcells/s"
     else:
-        return f"{cells_per_sec / 1e3:.1f} Kcells³/s"
+        return f"{cells_per_sec / 1e3:.1f} Kcells/s"
 
 
 def benchmark_implementation(
@@ -330,7 +330,7 @@ def benchmark_implementation(
     warmup: int,
     repeat: int,
 ):
-    """Run warmup and benchmark iterations, returning (avg_time, result, success).
+    """Run warmup and benchmark iterations, returning the mean seconds and the last result.
 
     Args:
         callback: Function to benchmark
@@ -343,71 +343,69 @@ def benchmark_implementation(
     """
     # Warmup iterations on full dataset (important for JIT/GPU tuning)
     for i in range(warmup):
-        start_time = time.time()
+        start_time = time.perf_counter()
         _ = callback(preferences)
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.perf_counter() - start_time
         if warmup > 1:
-            print(f"  Warm-up {i+1}/{warmup}: {format_time(elapsed_time)}")
+            print(f"  Warm-up {i + 1}/{warmup}: {format_time(elapsed_time)}")
         else:
             print(f"  Warm-up: {format_time(elapsed_time)}")
 
     # Benchmark iterations
     times = []
     result = None
-    for i in range(repeat):
-        start_time = time.time()
+    for _ in range(repeat):
+        start_time = time.perf_counter()
         result = callback(preferences)
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.perf_counter() - start_time
         times.append(elapsed_time)
 
     avg_time = sum(times) / len(times)
-    return avg_time, result, True
+    return avg_time, result
+
+
+# Tile sizes the C++ extension actually instantiates, in `scaling_elections.cu`.
+CPU_TILE_SIZES = (4, 8, 16, 32, 64, 128)
+GPU_TILE_SIZES = (4, 8, 16, 32)
 
 
 # Benchmark and comparison code remains the same
 if __name__ == "__main__":
-    import time
     import argparse
 
     parser = argparse.ArgumentParser(description="Benchmark the Schulze method")
     parser.add_argument(
         "--num-voters",
         type=int,
-        default=0,
+        default=2000,
         help="Number of voters in the population, 0 for random preference matrix",
     )
     parser.add_argument(
         "--num-candidates",
         type=int,
-        default=256,
+        default=128,
         help="Number of candidates in the election",
     )
     parser.add_argument(
-        "--run-cpu",
-        action="store_true",
-        help="Run CPU implementations (Numba, OpenMP)",
-    )
-    parser.add_argument(
-        "--run-gpu",
-        action="store_true",
-        help="Run GPU implementation (CUDA)",
-    )
-    parser.add_argument(
-        "--no-serial",
-        action="store_true",
-        help="Skip serial baseline",
+        "-k",
+        "--filter",
+        metavar="REGEX",
+        default=".",
+        help="Regex selecting which backends to run, matched against their names",
     )
     parser.add_argument(
         "--cpu-tile-size",
         type=int,
-        default=16,
-        help="CPU tile size for tiling optimization",
+        default=32,
+        choices=CPU_TILE_SIZES,
+        help="CPU tile size for tiling optimization (default: 32)",
     )
     parser.add_argument(
         "--gpu-tile-size",
         type=int,
         default=32,
-        help="GPU tile size for tiling optimization",
+        choices=GPU_TILE_SIZES,
+        help="GPU tile size for tiling optimization (default: 32)",
     )
     parser.add_argument(
         "--warmup",
@@ -416,46 +414,47 @@ if __name__ == "__main__":
         help="Number of warmup iterations (default: 1)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for the preference generator (default: 42)",
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=1,
         help="Number of benchmark iterations (default: 1)",
     )
     args = parser.parse_args()
+    if args.num_candidates < 4:
+        parser.error("--num-candidates must be at least 4")
+    if args.num_voters < 0:
+        parser.error("--num-voters cannot be negative")
+    if args.warmup < 0:
+        parser.error("--warmup cannot be negative")
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1")
 
     cpu_tile_size = args.cpu_tile_size
     gpu_tile_size = args.gpu_tile_size
     num_voters = args.num_voters
     num_candidates = args.num_candidates
-    run_serial = not args.no_serial
+    selector = re.compile(args.filter)
 
-    compute_strongest_paths_cuda = lambda x: compute_strongest_paths(
-        x,
-        allow_gpu=True,
-        allow_tma=False,
-        tile_size=gpu_tile_size,
-    )
-    compute_strongest_paths_hopper = lambda x: compute_strongest_paths(
-        x,
-        allow_gpu=True,
-        allow_tma=True,
-        tile_size=gpu_tile_size,
-    )
-    compute_strongest_paths_openmp = lambda x: compute_strongest_paths(
-        x,
-        allow_gpu=False,
-        allow_tma=False,
-        tile_size=cpu_tile_size,
-    )
-    compute_strongest_paths_numba_tiled = (
-        lambda x: compute_strongest_paths_numba_parallel(
-            x,
-            tile_size=cpu_tile_size,
-        )
-    )
+    # The first selected backend that succeeds becomes the baseline every later one validates against.
+    backends = [
+        ("Serial (Numba)", lambda p: compute_strongest_paths_numba_serial(p)),
+        ("Tiled CPU (Numba)", lambda p: compute_strongest_paths_numba_parallel(p, tile_size=cpu_tile_size)),
+        ("Tiled CPU (OpenMP)", lambda p: compute_strongest_paths(p, backend="cpu_openmp", tile_size=cpu_tile_size)),
+        ("Tiled GPU", lambda p: compute_strongest_paths(p, backend="gpu_serial", tile_size=gpu_tile_size)),
+        ("Tiled GPU (Hopper)", lambda p: compute_strongest_paths(p, backend="gpu_hopper", tile_size=gpu_tile_size)),
+    ]
+    selected = [(name, callback) for name, callback in backends if selector.search(name)]
+    if not selected:
+        parser.error(f"--filter {args.filter!r} matched no backend of: " + ", ".join(name for name, _ in backends))
 
     # Print header
-    print("=== Schulze Voting Algorithm (Python) ===")
+    print("Schulze Voting Algorithm (Python)")
     print()
 
     # Print GPU info if available
@@ -469,104 +468,64 @@ if __name__ == "__main__":
     voters_str = f"{num_voters:,}" if num_voters > 0 else "random"
     print(f"  Problem size: {num_candidates:,} candidates × {voters_str} voters")
     print(f"  CPU tile: {cpu_tile_size} × {cpu_tile_size}")
-    if args.run_gpu:
-        print(f"  GPU tile: {gpu_tile_size} × {gpu_tile_size}")
+    print(f"  GPU tile: {gpu_tile_size} × {gpu_tile_size}")
     print(f"  CPU threads: {get_num_threads()}")
     print(f"  Warmup: {args.warmup}, Repeat: {args.repeat}")
+    print(f"  Backends: {', '.join(name for name, _ in selected)}")
     print()
 
     # Generate random voter rankings
     print("Generating preferences...")
+    generator = np.random.default_rng(args.seed)
     if num_voters == 0:
-        preferences = np.random.randint(
-            0, num_candidates, (num_candidates, num_candidates)
-        ).astype(np.uint32)
+        preferences = generator.integers(0, num_candidates, (num_candidates, num_candidates), dtype=np.uint32)
     else:
-        voter_rankings = [
-            np.random.permutation(num_candidates) for _ in range(num_voters)
-        ]
+        voter_rankings = [generator.permutation(num_candidates) for _ in range(num_voters)]
         preferences = build_pairwise_preferences(voter_rankings)
 
     # Benchmarking section
     print()
-    print("─── Benchmarking ───────────────────────────────────")
+    print("Benchmarking")
     print()
 
-    # Always run serial first as baseline (unless --no-serial)
-    serial_result = None
-    if run_serial:
-        print("→ Serial (Numba)")
-        try:
-            avg_time, serial_result, _ = benchmark_implementation(
-                compute_strongest_paths_numba_serial,
-                preferences,
-                args.warmup,
-                args.repeat,
-            )
-            throughput = num_candidates**3 / avg_time
-            if args.repeat > 1:
-                print(
-                    f"  Run:     {format_time(avg_time)} (avg of {args.repeat}) │ {format_throughput(throughput)}"
-                )
-            else:
-                print(
-                    f"  Run:     {format_time(avg_time)} │ {format_throughput(throughput)}"
-                )
-        except Exception as e:
-            print(f"  ✗ Benchmark failed: {e}")
-        print()
-
-    # Run other implementations and validate against serial
-    for name, wanted, callback in [
-        ("Tiled CPU (Numba)", args.run_cpu, compute_strongest_paths_numba_tiled),
-        ("Tiled CPU (C++ with OpenMP)", args.run_cpu, compute_strongest_paths_openmp),
-        ("Tiled GPU (CUDA)", args.run_gpu, compute_strongest_paths_cuda),
-        ("Tiled GPU (CUDA + TMA)", args.run_gpu, compute_strongest_paths_hopper),
-    ]:
-        if not wanted:
-            continue
-
+    baseline = None
+    baseline_callback = None
+    for name, callback in selected:
         print(f"→ {name}")
         try:
-            avg_time, result, _ = benchmark_implementation(
-                callback, preferences, args.warmup, args.repeat
-            )
+            avg_time, result = benchmark_implementation(callback, preferences, args.warmup, args.repeat)
             throughput = num_candidates**3 / avg_time
             if args.repeat > 1:
-                print(
-                    f"  Run:     {format_time(avg_time)} (avg of {args.repeat}) │ {format_throughput(throughput)}"
-                )
+                print(f"  Run:     {format_time(avg_time)} (avg of {args.repeat}) │ {format_throughput(throughput)}")
             else:
-                print(
-                    f"  Run:     {format_time(avg_time)} │ {format_throughput(throughput)}"
-                )
+                print(f"  Run:     {format_time(avg_time)} │ {format_throughput(throughput)}")
 
-            # Validate against serial baseline if available
-            if serial_result is not None:
-                if np.array_equal(result, serial_result):
-                    print(f"  ✓ Results validated")
-                else:
-                    print(f"  ✗ Results don't match baseline!")
+            if baseline is None:
+                baseline, baseline_callback = result, callback
+            elif np.array_equal(result, baseline):
+                print("  ✓ Results validated")
+            else:
+                print("  ✗ Results don't match baseline!")
         except Exception as e:
             print(f"  ✗ Benchmark failed: {e}")
         print()
 
-    # Determine the winner and ranking (use serial if available, otherwise compute)
-    if serial_result is not None:
-        result_for_winner = serial_result
-    else:
-        # Compute a result for winner determination if no serial was run
-        result_for_winner = compute_strongest_paths_numba_serial(preferences)
+    # Name the winner from whatever already ran, so a filtered-out kernel is never run behind
+    # the caller's back.
+    if baseline is None:
+        print("Election Results")
+        print()
+        print("  No implementation was run, so there is no ranking to report.")
+        print()
+        raise SystemExit(0)
 
-    candidates = list(range(result_for_winner.shape[0]))
-    winner, ranking = get_winner_and_ranking(candidates, result_for_winner)
+    candidates = list(range(baseline.shape[0]))
+    winner, ranking = get_winner_and_ranking(candidates, baseline)
 
     # Print election results
-    print("─── Election Results ───────────────────────────────")
+    print("Election Results")
     print()
     print(f"  Winner: Candidate #{winner}")
     if len(ranking) >= 5:
-        print(
-            f"  Top 5:  #{ranking[0]}, #{ranking[1]}, #{ranking[2]}, #{ranking[3]}, #{ranking[4]}"
-        )
+        print(f"  Top 5:  #{ranking[0]}, #{ranking[1]}, #{ranking[2]}, #{ranking[3]}, #{ranking[4]}")
     print()

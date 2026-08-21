@@ -16,14 +16,34 @@ The entire native library build is packed into `setup.py` for Python, and `pixi`
 Both Python and Mojo implementations are included.
 Both support the same CLI arguments:
 
-- `--no-serial`: Skip serial baseline
+- `-k REGEX`, `--filter REGEX`: Select which backends run, matched against their names
 - `--num-candidates N`: Number of candidates (default: 128)
-- `--num-voters N`: Number of voters (default: 2000)
-- `--run-cpu`: Run CPU implementations
-- `--run-gpu`: Run GPU implementation
-- `--cpu-tile-size N`: CPU tile size (default: 16)
+- `--num-voters N`: Number of voters (default: 2000), 0 to generate a random matrix directly
+- `--cpu-tile-size N`: CPU tile size (default: 32)
 - `--gpu-tile-size N`: GPU tile size (default: 32)
+- `--warmup N`: Warm-up iterations to discard (default: 1)
+- `--repeat N`: Timed iterations to average (default: 1)
 - `--help, -h`: Show help message
+
+Every backend is selected by name, so `-k GPU` runs both GPU rows and `-k Hopper` runs only the bulk-tensor one.
+Python matches the pattern as a regular expression, Mojo as a case-insensitive substring, and the default `.` selects everything.
+The backend names are:
+
+| Driver | Names                                                                                          |
+| :----- | :--------------------------------------------------------------------------------------------- |
+| Python | `Serial (Numba)`, `Tiled CPU (Numba)`, `Tiled CPU (OpenMP)`, `Tiled GPU`, `Tiled GPU (Hopper)` |
+| Mojo   | `Serial (Mojo)`, `Tiled CPU (Mojo)`, `Tiled CPU+SIMD (Mojo)`, `Tiled GPU (Mojo)`               |
+
+The first backend that runs becomes the baseline the rest are validated against.
+Both drivers compile the same tile sizes — 4, 8, 16, 32, 64 and 128 for `--cpu-tile-size`, and 4, 8, 16 and 32 for `--gpu-tile-size` — and reject anything else, along with unrecognized flags.
+
+The extension itself takes the backend by name rather than by flags, and raises instead of quietly falling back when a device or a build cannot serve it:
+
+```py
+compute_strongest_paths(preferences, backend="cpu_openmp", tile_size=32)
+compute_strongest_paths(preferences, backend="gpu_serial", tile_size=32)
+compute_strongest_paths(preferences, backend="gpu_hopper", tile_size=32)  # needs sm_90 or newer
+```
 
 ### Python
 
@@ -40,7 +60,7 @@ Build the environment and run with `uv`:
 uv venv -p python3.12               # Pick a recent Python version
 uv sync --extra cpu                 # Build locally and install dependencies
 uv run scaling_elections.py         # Run the default problem size
-uv run scaling_elections.py --num-candidates 4096 --num-voters 4096 --run-cpu --run-gpu
+uv run scaling_elections.py --num-candidates 4096 --num-voters 4096
 ```
 
 Alternatively, with your local environment:
@@ -58,14 +78,14 @@ To install and run it, use `pixi`:
 ```sh
 pixi install
 pixi run mojo scaling_elections.mojo --help
-pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 4096 --run-cpu --run-gpu
+pixi run mojo scaling_elections.mojo --num-candidates 4096 --num-voters 4096
 ```
 
 Or compile and run as a standalone binary:
 
 ```sh
 pixi run mojo build scaling_elections.mojo -o schulze
-./schulze --num-candidates 4096 --run-cpu --run-gpu
+./schulze --num-candidates 4096
 ```
 
 ## Links
@@ -97,7 +117,7 @@ Or in our case, in Giga- or TeraCells per Second (gcs/tcs), where a cell is a si
 With NVIDIA Nsight Compute CLI we can dissect the kernels and see that there is more room for improvement:
 
 ```sh
-ncu uv run scaling_elections.py --num-candidates 4096 --num-voters 4096 --gpu-tile-size 32 --run-gpu
+ncu uv run scaling_elections.py --num-candidates 4096 --num-voters 4096 --gpu-tile-size 32 -k GPU
 >  void _cuda_independent<32>(unsigned int, unsigned int, unsigned int *) (128, 128, 1)x(32, 32, 1), Context 1, Stream 7, Device 0, CC 9.0
 >    Section: GPU Speed Of Light Throughput
 >    ----------------------- ----------- ------------

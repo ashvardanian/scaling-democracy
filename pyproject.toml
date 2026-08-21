@@ -20,3 +20,35 @@ cpu = ["numba>=0.67", "pytest>=9.1"]
 
 [tool.setuptools]
 py-modules = ["scaling_elections"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
+filterwarnings = ["error"]
+minversion = "6.0"
+xfail_strict = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+ignore = [
+  "E501", # line too long, handled by the formatter
+  "E741", # ambiguous variable names
+]
+select = [
+  "E", # pycodestyle errors
+  "W", # pycodestyle warnings
+  "F", # pyflakes
+  "I", # isort import ordering
+  "UP", # pyupgrade
+  "YTT", # flake8-2020
+  "B", # flake8-bugbear
+  "SIM", # flake8-simplify
+]
+
+[dependency-groups]
+lint = ["ruff>=0.15.8"]
