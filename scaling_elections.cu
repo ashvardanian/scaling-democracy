@@ -619,7 +619,7 @@ inline void process_tile_openmp_(                 //
             uint32x4_t b_row_plus_k_vec = vdupq_n_u32(b_row + k);
             for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
                 uint32x4_t a_vec = vdupq_n_u32(a[bi][k]);
-                uint32x4_t is_not_diagonal_a = vdupq_n_u32((a_row + bi) != (a_col + k));
+                uint32x4_t is_not_diagonal_a = vmvnq_u32(vceqq_u32(vdupq_n_u32(a_row + bi), vdupq_n_u32(a_col + k)));
                 uint32x4_t c_row_plus_bi_vec = vdupq_n_u32(c_row + bi);
 #if defined(__clang__) // Apple's Clang can't handle `#pragma unroll`
 #pragma clang loop unroll(full)
@@ -644,7 +644,7 @@ inline void process_tile_openmp_(                 //
                             vandq_u32(                                              //
                                 vmvnq_u32(vorrq_u32(is_diagonal_c, is_diagonal_b)), //
                                 vandq_u32(is_not_diagonal_a, is_bigger));
-                        c_vec = vbslq_u32(smallest, c_vec, will_replace);
+                        c_vec = vbslq_u32(will_replace, smallest, c_vec);
                     } else {
                         c_vec = vmaxq_u32(c_vec, smallest);
                     }
@@ -654,7 +654,7 @@ inline void process_tile_openmp_(                 //
         }
         return;
     }
-#else
+#endif
     for (candidate_idx_t k = 0; k < tile_size; k++) {
         for (candidate_idx_t bi = 0; bi < tile_size; bi++) {
             votes_count_t* const c_cells = &c[bi][0];
@@ -675,7 +675,6 @@ inline void process_tile_openmp_(                 //
             }
         }
     }
-#endif
 }
 
 template <std::uint32_t tile_size, bool check_tail = false>
@@ -696,7 +695,7 @@ void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_t
         }
         return;
     }
-#else
+#endif
 
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
@@ -705,7 +704,6 @@ void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_t
                     target[i][j] = source[i * stride + j];
             } else
                 target[i][j] = source[i * stride + j];
-#endif
 }
 
 template <std::uint32_t tile_size, bool check_tail = false>
@@ -726,7 +724,7 @@ void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride,
         }
         return;
     }
-#else
+#endif
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
             if constexpr (check_tail) {
@@ -734,7 +732,6 @@ void memcpy2d(votes_count_tile<tile_size> const& source, candidate_idx_t stride,
                     target[i * stride + j] = source[i][j];
             } else
                 target[i * stride + j] = source[i][j];
-#endif
 }
 
 template <std::uint32_t tile_size, bool check_tail = false> //
