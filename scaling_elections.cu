@@ -3,13 +3,14 @@
  * @file   scaling_elections.cu
  * @author Ash Vardanian
  * @date   July 12, 2024
- * @see    https://ashvardanian.com/ScalingElections
+ * @see    https://ashvardanian.com/posts/scaling-elections
  */
+#include <csignal> // `std::signal`
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `std::printf`
+#include <cstdlib> // `std::rand`
+
 #include <algorithm> // `std::min`, `std::max`
-#include <csignal>   // `std::signal`
-#include <cstdint>   // `std::uint32_t`
-#include <cstdio>    // `std::printf`
-#include <cstdlib>   // `std::rand`
 #include <stdexcept> // `std::runtime_error`
 #include <thread>    // `std::thread::hardware_concurrency()`
 #include <vector>    // `std::vector`

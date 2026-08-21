@@ -38,7 +38,7 @@ Build the environment and run with `uv`:
 
 ```sh
 uv venv -p python3.12               # Pick a recent Python version
-uv sync --extra cpu --extra gpu     # Build locally and install dependencies
+uv sync --extra cpu                 # Build locally and install dependencies
 uv run scaling_elections.py         # Run the default problem size
 uv run scaling_elections.py --num-candidates 4096 --num-voters 4096 --run-cpu --run-gpu
 ```
@@ -70,7 +70,7 @@ pixi run mojo build scaling_elections.mojo -o schulze
 
 ## Links
 
-- [Blogpost](https://ashvardanian.com/posts/scaling-democracy/)
+- [Blogpost](https://ashvardanian.com/posts/scaling-elections)
 - [Schulze voting method description](https://en.wikipedia.org/wiki/Schulze_method)
 - [On traversal order for Floyd Warshall algorithm](https://moorejs.github.io/APSP-in-parallel/)
 - [CUDA + Python project template](https://github.com/ashvardanian/cuda-python-starter-kit)

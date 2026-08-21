@@ -32,112 +32,119 @@ pixi run mojo build scaling_elections.mojo -o scaling_elections
 ./scaling_elections
 ```
 
-See: https://ashvardanian.com/posts/scaling-democracy/
+See: https://ashvardanian.com/posts/scaling-elections
 """
 
-# Core data structures and memory management
-from collections import List
-from memory import UnsafePointer, memset_zero, stack_allocation, AddressSpace
+from std.builtin.sort import sort
+from std.gpu import block_idx, thread_idx
+from std.math import iota
+from std.memory import (
+    AddressSpace,
+    Layout,
+    alloc,
+    stack_allocation,
+    unsafe_memset_zero,
+)
+from std.random import random_si64
+from std.sys import argv, has_accelerator
+from std.time import perf_counter_ns
+from max.algorithm import parallelize
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
 
-# Algorithms and utilities
-from algorithm import parallelize
-from builtin.sort import sort
-from random import random_si64
-
-# System and runtime
-from sys import argv, has_accelerator, simdwidthof
-from time import perf_counter_ns
-
-# GPU acceleration
-from buffer import NDBuffer
-from layout import Layout, LayoutTensor
-
-# TODO: Find a good way to feature-gate GPU code for CPU-only machines
-from gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from gpu.id import block_idx, thread_idx, block_dim, global_idx
-from gpu.sync import barrier
-
-# Type aliases for clarity
-alias VotesCount = UInt32
-alias CandidateIdx = Int
+# region Types
 
 # ! Tile sizes control cache utilization and parallelism efficiency.
 # ! CPU: 32x32 fits L2 cache and simplifies AVX-512.
 # ! GPU: 32x32 matches NVIDIA warp size (32 threads), maximizes occupancy.
 # ! Pre-compiled variants allow runtime selection without JIT overhead.
-alias DEFAULT_CPU_TILE_SIZE = 32
-alias DEFAULT_GPU_TILE_SIZE = 32
-alias ALLOWED_CPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)
-alias ALLOWED_GPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64)
+comptime DEFAULT_CPU_TILE_SIZE = 32
+comptime DEFAULT_GPU_TILE_SIZE = 32
+comptime ALLOWED_CPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)
+comptime ALLOWED_GPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64)
+
 
 @fieldwise_init
-struct IndexedScore(Copyable, Movable, Comparable):
+struct IndexedScore(Comparable, Copyable, Equatable, Movable):
     """Pairs a candidate index with their win count for sorting."""
+
     var idx: Int
     var score: Int
 
-    fn __lt__(self, other: Self) -> Bool:
+    def __lt__(self, other: Self) -> Bool:
         # Sort in descending order by score (higher scores first)
         return self.score > other.score
 
-    fn __le__(self, other: Self) -> Bool:
+    def __le__(self, other: Self) -> Bool:
         return self.score >= other.score
 
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         return self.score == other.score
 
-    fn __ne__(self, other: Self) -> Bool:
+    def __ne__(self, other: Self) -> Bool:
         return self.score != other.score
 
-    fn __gt__(self, other: Self) -> Bool:
+    def __gt__(self, other: Self) -> Bool:
         return self.score < other.score
 
-    fn __ge__(self, other: Self) -> Bool:
+    def __ge__(self, other: Self) -> Bool:
         return self.score <= other.score
+
 
 @fieldwise_init
 struct PreferenceMatrix(Movable):
     """Represents a preference matrix for Schulze voting."""
-    var data: UnsafePointer[UInt32]
+
+    var data: Pointer[UInt32, MutUntrackedOrigin]
     var num_candidates: Int
 
-    fn __init__(out self, num_candidates: Int):
+    def __init__(out self, num_candidates: Int):
         self.num_candidates = num_candidates
         var size = num_candidates * num_candidates
-        self.data = UnsafePointer[UInt32].alloc(size)
-        memset_zero(self.data, size)
+        self.data = alloc(Layout[UInt32](count=size)).unsafe_leak()
+        unsafe_memset_zero(self.data, size)
 
-    fn __getitem__(self, i: Int, j: Int) -> UInt32:
-        return self.data[i * self.num_candidates + j]
+    def __getitem__(self, i: Int, j: Int) -> UInt32:
+        return self.data[unsafe_offset=i * self.num_candidates + j]
 
-    fn __setitem__(mut self, i: Int, j: Int, value: UInt32):
-        self.data[i * self.num_candidates + j] = value
+    def __setitem__(mut self, i: Int, j: Int, value: UInt32):
+        self.data[unsafe_offset=i * self.num_candidates + j] = value
 
-    fn __del__(deinit self):
-        self.data.free()
+    def __deinit__(deinit self):
+        self.data.unsafe_free()
+
 
 @fieldwise_init
 struct StrongestPathsMatrix(Movable):
     """Represents the strongest paths matrix result."""
-    var data: UnsafePointer[UInt32]
+
+    var data: Pointer[UInt32, MutUntrackedOrigin]
     var num_candidates: Int
 
-    fn __init__(out self, num_candidates: Int):
+    def __init__(out self, num_candidates: Int):
         self.num_candidates = num_candidates
         var size = num_candidates * num_candidates
-        self.data = UnsafePointer[UInt32].alloc(size)
-        memset_zero(self.data, size)
+        self.data = alloc(Layout[UInt32](count=size)).unsafe_leak()
+        unsafe_memset_zero(self.data, size)
 
-    fn __getitem__(self, i: Int, j: Int) -> UInt32:
-        return self.data[i * self.num_candidates + j]
+    def __getitem__(self, i: Int, j: Int) -> UInt32:
+        return self.data[unsafe_offset=i * self.num_candidates + j]
 
-    fn __setitem__(mut self, i: Int, j: Int, value: UInt32):
-        self.data[i * self.num_candidates + j] = value
+    def __setitem__(mut self, i: Int, j: Int, value: UInt32):
+        self.data[unsafe_offset=i * self.num_candidates + j] = value
 
-    fn __del__(deinit self):
-        self.data.free()
+    def __deinit__(deinit self):
+        self.data.unsafe_free()
 
-fn populate_preferences_from_ranking(mut preferences: PreferenceMatrix, ranking: List[Int]):
+
+# endregion Types
+
+# region Preferences
+
+
+def populate_preferences_from_ranking(
+    mut preferences: PreferenceMatrix, ranking: List[Int]
+):
     """
     Populates the preference matrix based on a ranking of candidates.
 
@@ -153,7 +160,10 @@ fn populate_preferences_from_ranking(mut preferences: PreferenceMatrix, ranking:
             var current_count = preferences[preferred, opponent]
             preferences[preferred, opponent] = current_count + 1
 
-fn build_pairwise_preferences(voter_rankings: List[List[Int]]) -> PreferenceMatrix:
+
+def build_pairwise_preferences(
+    voter_rankings: List[List[Int]],
+) -> PreferenceMatrix:
     """
     Builds a pairwise preference matrix from voter rankings.
 
@@ -199,7 +209,15 @@ fn build_pairwise_preferences(voter_rankings: List[List[Int]]) -> PreferenceMatr
 
     return preferences^
 
-fn compute_strongest_paths_serial(preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
+
+# endregion Preferences
+
+# region Serial Reference
+
+
+def compute_strongest_paths_serial(
+    preferences: PreferenceMatrix,
+) raises -> StrongestPathsMatrix:
     """
     Serial implementation of Schulze strongest paths computation.
 
@@ -238,15 +256,24 @@ fn compute_strongest_paths_serial(preferences: PreferenceMatrix) raises -> Stron
 
     return strongest_paths^
 
-fn process_tile_cpu[tile_size: Int](
-    c: UnsafePointer[UInt32],
-    a: UnsafePointer[UInt32],
-    b: UnsafePointer[UInt32],
-    c_row: Int, c_col: Int,
+
+# endregion Serial Reference
+
+# region CPU Tiles
+
+
+def process_tile_cpu[
+    tile_size: Int
+](
+    c: Pointer[UInt32, MutUntrackedOrigin],
+    a: Pointer[UInt32, MutUntrackedOrigin],
+    b: Pointer[UInt32, MutUntrackedOrigin],
+    c_row: Int,
+    c_col: Int,
     a_col: Int,
     b_col: Int,
     num_candidates: Int,
-    tile_stride: Int
+    tile_stride: Int,
 ):
     """
     CPU-optimized tile processing for blocked Schulze algorithm.
@@ -270,21 +297,30 @@ fn process_tile_cpu[tile_size: Int](
                 var global_j = c_col + bj
                 var global_k = a_col + k
 
-                if global_i >= num_candidates or global_j >= num_candidates or global_k >= num_candidates:
+                if (
+                    global_i >= num_candidates
+                    or global_j >= num_candidates
+                    or global_k >= num_candidates
+                ):
                     continue
 
                 # Skip diagonal elements
-                if global_i == global_j or global_i == global_k or global_k == global_j:
+                if (
+                    global_i == global_j
+                    or global_i == global_k
+                    or global_k == global_j
+                ):
                     continue
 
-                var a_val = a[bi * tile_stride + k]
-                var b_val = b[k * tile_stride + bj]
+                var a_val = a[unsafe_offset=bi * tile_stride + k]
+                var b_val = b[unsafe_offset=k * tile_stride + bj]
                 var c_idx = bi * tile_stride + bj
-                var c_val = c[c_idx]
+                var c_val = c[unsafe_offset=c_idx]
                 var new_val = min(a_val, b_val)
 
                 if new_val > c_val:
-                    c[c_idx] = new_val
+                    c[unsafe_offset=c_idx] = new_val
+
 
 # =============================================================================
 # SIMD-VECTORIZED CPU TILE PROCESSORS FOR SCHULZE VOTING ALGORITHM
@@ -294,11 +330,14 @@ fn process_tile_cpu[tile_size: Int](
 # Mirrors GPU's phase-specific design but uses SIMD vectors instead of threads
 # =============================================================================
 
-fn process_tile_cpu_simd_independent[tile_size: Int, simd_width: Int](
-    c: UnsafePointer[UInt32],
-    a: UnsafePointer[UInt32],
-    b: UnsafePointer[UInt32],
-    tile_stride: Int
+
+def process_tile_cpu_simd_independent[
+    tile_size: Int, simd_width: Int
+](
+    c: Pointer[UInt32, MutUntrackedOrigin],
+    a: Pointer[UInt32, MutUntrackedOrigin],
+    b: Pointer[UInt32, MutUntrackedOrigin],
+    tile_stride: Int,
 ):
     """
     SIMD-vectorized tile processor for independent tiles (no diagonal checking needed).
@@ -310,17 +349,14 @@ fn process_tile_cpu_simd_independent[tile_size: Int, simd_width: Int](
         b: Second input tile.
         tile_stride: Stride for accessing tiles.
     """
-    # Compile-time assertion: tile_size must be divisible by simd_width
-    constrained[tile_size % simd_width == 0, "tile_size must be divisible by simd_width"]()
-
     # Process k loop over intermediate values
     for k in range(tile_size):
         # Process each row
         for bi in range(tile_size):
-            var a_val = a[bi * tile_stride + k]
+            var a_val = a[unsafe_offset=bi * tile_stride + k]
 
             # Vectorized processing of columns (j dimension)
-            alias num_simd_chunks = tile_size // simd_width
+            comptime num_simd_chunks = tile_size // simd_width
 
             # Process all elements with SIMD
             for chunk in range(num_simd_chunks):
@@ -329,8 +365,8 @@ fn process_tile_cpu_simd_independent[tile_size: Int, simd_width: Int](
                 var b_base_idx = k * tile_stride + bj
 
                 # Load SIMD vectors
-                var c_vec = c.load[width=simd_width](c_base_idx)
-                var b_vec = b.load[width=simd_width](b_base_idx)
+                var c_vec = c.unsafe_load[width=simd_width](c_base_idx)
+                var b_vec = b.unsafe_load[width=simd_width](b_base_idx)
 
                 # Broadcast a_val to SIMD vector
                 var a_vec = SIMD[DType.uint32, simd_width](a_val)
@@ -340,17 +376,20 @@ fn process_tile_cpu_simd_independent[tile_size: Int, simd_width: Int](
                 var new_c = max(c_vec, min_val)
 
                 # Store result
-                c.store[width=simd_width](c_base_idx, new_c)
+                c.unsafe_store[width=simd_width](c_base_idx, new_c)
 
-fn process_tile_cpu_simd_diagonal[tile_size: Int, simd_width: Int](
-    c: UnsafePointer[UInt32],
-    a: UnsafePointer[UInt32],
-    b: UnsafePointer[UInt32],
+
+def process_tile_cpu_simd_diagonal[
+    tile_size: Int, simd_width: Int
+](
+    c: Pointer[UInt32, MutUntrackedOrigin],
+    a: Pointer[UInt32, MutUntrackedOrigin],
+    b: Pointer[UInt32, MutUntrackedOrigin],
     c_row: Int,
     c_col: Int,
     a_col: Int,
     num_candidates: Int,
-    tile_stride: Int
+    tile_stride: Int,
 ):
     """
     SIMD-vectorized tile processor for diagonal tiles (requires diagonal avoidance).
@@ -366,9 +405,6 @@ fn process_tile_cpu_simd_diagonal[tile_size: Int, simd_width: Int](
         num_candidates: Total number of candidates.
         tile_stride: Stride for accessing tiles.
     """
-    # Compile-time assertion: tile_size must be divisible by simd_width
-    constrained[tile_size % simd_width == 0, "tile_size must be divisible by simd_width"]()
-
     # Process k loop
     for k in range(tile_size):
         var global_k = a_col + k
@@ -376,10 +412,10 @@ fn process_tile_cpu_simd_diagonal[tile_size: Int, simd_width: Int](
         # Process each row
         for bi in range(tile_size):
             var global_i = c_row + bi
-            var a_val = a[bi * tile_stride + k]
+            var a_val = a[unsafe_offset=bi * tile_stride + k]
 
             # Vectorized processing with diagonal masking
-            alias num_simd_chunks = tile_size // simd_width
+            comptime num_simd_chunks = tile_size // simd_width
 
             # Process all elements with SIMD
             for chunk in range(num_simd_chunks):
@@ -388,39 +424,35 @@ fn process_tile_cpu_simd_diagonal[tile_size: Int, simd_width: Int](
                 var b_base_idx = k * tile_stride + bj
 
                 # Load SIMD vectors
-                var c_vec = c.load[width=simd_width](c_base_idx)
-                var b_vec = b.load[width=simd_width](b_base_idx)
+                var c_vec = c.unsafe_load[width=simd_width](c_base_idx)
+                var b_vec = b.unsafe_load[width=simd_width](b_base_idx)
                 var a_vec = SIMD[DType.uint32, simd_width](a_val)
 
                 # Compute candidate new values
                 var min_val = min(a_vec, b_vec)
 
-                # Build diagonal mask (branchless)
-                var mask = SIMD[DType.bool, simd_width]()
-                @parameter
-                fn compute_mask[width: Int]():
-                    for lane in range(width):
-                        var global_j = c_col + bj + lane
-                        # Allow update if: not on diagonal AND new_val > old_val
-                        var not_diag_c = global_i != global_j
-                        var not_diag_a = global_i != global_k
-                        var not_diag_b = global_k != global_j
-                        var is_bigger = min_val[lane] > c_vec[lane]
-                        mask[lane] = not_diag_c and not_diag_a and not_diag_b and is_bigger
+                # Lane `lane` covers candidate `c_col + bj + lane`; skip the three diagonals.
+                var global_j = iota[DType.int32, simd_width]() + Int32(
+                    c_col + bj
+                )
+                var mask = (
+                    global_j.ne(Int32(global_i))
+                    & global_j.ne(Int32(global_k))
+                    & min_val.gt(c_vec)
+                    & SIMD[DType.bool, simd_width](fill=global_i != global_k)
+                )
+                c.unsafe_store[width=simd_width](
+                    c_base_idx, mask.select(min_val, c_vec)
+                )
 
-                compute_mask[simd_width]()
 
-                # Conditional update using select (mask ? min_val : c_vec)
-                var new_c = mask.select(min_val, c_vec)
-                c.store[width=simd_width](c_base_idx, new_c)
-
-fn copy_tile_to_buffer(
-    source: UnsafePointer[UInt32],
-    dest: UnsafePointer[UInt32],
+def copy_tile_to_buffer(
+    source: Pointer[UInt32, MutUntrackedOrigin],
+    dest: Pointer[UInt32, MutUntrackedOrigin],
     start_row: Int,
     start_col: Int,
     tile_size: Int,
-    num_candidates: Int
+    num_candidates: Int,
 ):
     """Copy a tile from the global matrix to a local buffer."""
     for i in range(tile_size):
@@ -428,17 +460,20 @@ fn copy_tile_to_buffer(
             var row = start_row + i
             var col = start_col + j
             if row < num_candidates and col < num_candidates:
-                dest[i * tile_size + j] = source[row * num_candidates + col]
+                dest[unsafe_offset=i * tile_size + j] = source[
+                    unsafe_offset=row * num_candidates + col
+                ]
             else:
-                dest[i * tile_size + j] = 0
+                dest[unsafe_offset=i * tile_size + j] = 0
 
-fn copy_buffer_to_tile(
-    source: UnsafePointer[UInt32],
-    dest: UnsafePointer[UInt32],
+
+def copy_buffer_to_tile(
+    source: Pointer[UInt32, MutUntrackedOrigin],
+    dest: Pointer[UInt32, MutUntrackedOrigin],
     start_row: Int,
     start_col: Int,
     tile_size: Int,
-    num_candidates: Int
+    num_candidates: Int,
 ):
     """Copy a tile from a local buffer back to the global matrix."""
     for i in range(tile_size):
@@ -446,10 +481,15 @@ fn copy_buffer_to_tile(
             var row = start_row + i
             var col = start_col + j
             if row < num_candidates and col < num_candidates:
-                dest[row * num_candidates + col] = source[i * tile_size + j]
+                dest[unsafe_offset=row * num_candidates + col] = source[
+                    unsafe_offset=i * tile_size + j
+                ]
+
 
 @always_inline
-fn calculate_tile_bounds(tile_idx: Int, tile_size: Int, total_size: Int) -> (Int, Int, Int):
+def calculate_tile_bounds(
+    tile_idx: Int, tile_size: Int, total_size: Int
+) -> Tuple[Int, Int, Int]:
     """
     Calculate tile boundaries for blocking algorithms.
 
@@ -466,7 +506,15 @@ fn calculate_tile_bounds(tile_idx: Int, tile_size: Int, total_size: Int) -> (Int
     var size = end - start
     return (start, end, size)
 
-fn compute_strongest_paths_tiled_cpu[tile_size: Int = DEFAULT_CPU_TILE_SIZE](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
+
+# endregion CPU Tiles
+
+# region CPU Drivers
+
+
+def compute_strongest_paths_tiled_cpu[
+    tile_size: Int = DEFAULT_CPU_TILE_SIZE
+](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
     """
     Tiled CPU implementation of Schulze strongest paths computation.
     Uses blocking for better cache utilization.
@@ -485,7 +533,7 @@ fn compute_strongest_paths_tiled_cpu[tile_size: Int = DEFAULT_CPU_TILE_SIZE](pre
 
     # Step 1: Initialize strongest paths
     @parameter
-    fn init_paths(i: Int):
+    def init_paths(i: Int):
         for j in range(num_candidates):
             if i != j:
                 var pref_ij = preferences[i, j]
@@ -501,127 +549,244 @@ fn compute_strongest_paths_tiled_cpu[tile_size: Int = DEFAULT_CPU_TILE_SIZE](pre
     var num_tiles = (num_candidates + tile_size - 1) // tile_size
 
     for k in range(num_tiles):
+        var k_index = k
         var k_bounds = calculate_tile_bounds(k, tile_size, num_candidates)
         var k_start = k_bounds[0]
-        var k_size = k_bounds[2]
 
         # Dependent phase: process diagonal tile
-        var diagonal_tile = stack_allocation[tile_size * tile_size, UInt32]()
-        memset_zero(diagonal_tile, tile_size * tile_size)
+        var diagonal_tile = stack_allocation[
+            tile_size * tile_size, UInt32, alignment=64
+        ]()
+        unsafe_memset_zero(diagonal_tile, tile_size * tile_size)
 
         copy_tile_to_buffer(
-            strongest_paths.data, diagonal_tile,
-            k_start, k_start, tile_size, num_candidates
+            strongest_paths.data,
+            diagonal_tile,
+            k_start,
+            k_start,
+            tile_size,
+            num_candidates,
         )
 
         process_tile_cpu[tile_size](
-            diagonal_tile, diagonal_tile, diagonal_tile,
-            k_start, k_start, k_start, k_start,
-            num_candidates, tile_size
+            diagonal_tile,
+            diagonal_tile,
+            diagonal_tile,
+            k_start,
+            k_start,
+            k_start,
+            k_start,
+            num_candidates,
+            tile_size,
         )
 
         copy_buffer_to_tile(
-            diagonal_tile, strongest_paths.data,
-            k_start, k_start, tile_size, num_candidates
+            diagonal_tile,
+            strongest_paths.data,
+            k_start,
+            k_start,
+            tile_size,
+            num_candidates,
         )
 
         # Partially dependent phases - row tiles
         @parameter
-        fn process_row_tiles(i: Int):
-            if i == k:
+        def process_row_tiles(i: Int):
+            if i == k_index:
                 return
 
             var i_bounds = calculate_tile_bounds(i, tile_size, num_candidates)
             var i_start = i_bounds[0]
-            var i_size = i_bounds[2]
 
-            var c_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var b_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile, tile_size * tile_size)
-            memset_zero(b_tile, tile_size * tile_size)
+            var c_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var b_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile, tile_size * tile_size)
+            unsafe_memset_zero(b_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile, i_start, k_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, b_tile, k_start, k_start, tile_size, num_candidates)
-
-            process_tile_cpu[tile_size](
-                c_tile, c_tile, b_tile,
-                i_start, k_start, k_start, k_start,
-                num_candidates, tile_size
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                b_tile,
+                k_start,
+                k_start,
+                tile_size,
+                num_candidates,
             )
 
-            copy_buffer_to_tile(c_tile, strongest_paths.data, i_start, k_start, tile_size, num_candidates)
+            process_tile_cpu[tile_size](
+                c_tile,
+                c_tile,
+                b_tile,
+                i_start,
+                k_start,
+                k_start,
+                k_start,
+                num_candidates,
+                tile_size,
+            )
+
+            copy_buffer_to_tile(
+                c_tile,
+                strongest_paths.data,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
 
         parallelize[process_row_tiles](num_tiles)
 
         # Partially dependent phases - column tiles
         @parameter
-        fn process_col_tiles(j: Int):
-            if j == k:
+        def process_col_tiles(j: Int):
+            if j == k_index:
                 return
 
             var j_bounds = calculate_tile_bounds(j, tile_size, num_candidates)
             var j_start = j_bounds[0]
-            var j_size = j_bounds[2]
 
-            var c_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var a_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile, tile_size * tile_size)
-            memset_zero(a_tile, tile_size * tile_size)
+            var c_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var a_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile, tile_size * tile_size)
+            unsafe_memset_zero(a_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile, k_start, j_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, a_tile, k_start, k_start, tile_size, num_candidates)
-
-            process_tile_cpu[tile_size](
-                c_tile, a_tile, c_tile,
-                k_start, j_start, k_start, j_start,
-                num_candidates, tile_size
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile,
+                k_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                a_tile,
+                k_start,
+                k_start,
+                tile_size,
+                num_candidates,
             )
 
-            copy_buffer_to_tile(c_tile, strongest_paths.data, k_start, j_start, tile_size, num_candidates)
+            process_tile_cpu[tile_size](
+                c_tile,
+                a_tile,
+                c_tile,
+                k_start,
+                j_start,
+                k_start,
+                j_start,
+                num_candidates,
+                tile_size,
+            )
+
+            copy_buffer_to_tile(
+                c_tile,
+                strongest_paths.data,
+                k_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
 
         parallelize[process_col_tiles](num_tiles)
 
         # Independent phase
         @parameter
-        fn process_independent_tiles(idx: Int):
+        def process_independent_tiles(idx: Int):
             var i = idx // num_tiles
             var j = idx % num_tiles
 
-            if i == k or j == k:
+            if i == k_index or j == k_index:
                 return
 
             var i_bounds = calculate_tile_bounds(i, tile_size, num_candidates)
             var i_start = i_bounds[0]
-            var i_size = i_bounds[2]
 
             var j_bounds = calculate_tile_bounds(j, tile_size, num_candidates)
             var j_start = j_bounds[0]
-            var j_size = j_bounds[2]
 
-            var c_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var a_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var b_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile, tile_size * tile_size)
-            memset_zero(a_tile, tile_size * tile_size)
-            memset_zero(b_tile, tile_size * tile_size)
+            var c_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var a_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var b_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile, tile_size * tile_size)
+            unsafe_memset_zero(a_tile, tile_size * tile_size)
+            unsafe_memset_zero(b_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile, i_start, j_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, a_tile, i_start, k_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, b_tile, k_start, j_start, tile_size, num_candidates)
-
-            process_tile_cpu[tile_size](
-                c_tile, a_tile, b_tile,
-                i_start, j_start, k_start, j_start,
-                num_candidates, tile_size
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile,
+                i_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                a_tile,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                b_tile,
+                k_start,
+                j_start,
+                tile_size,
+                num_candidates,
             )
 
-            copy_buffer_to_tile(c_tile, strongest_paths.data, i_start, j_start, tile_size, num_candidates)
+            process_tile_cpu[tile_size](
+                c_tile,
+                a_tile,
+                b_tile,
+                i_start,
+                j_start,
+                k_start,
+                j_start,
+                num_candidates,
+                tile_size,
+            )
+
+            copy_buffer_to_tile(
+                c_tile,
+                strongest_paths.data,
+                i_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
 
         parallelize[process_independent_tiles](num_tiles * num_tiles)
 
     return strongest_paths^
 
-fn compute_strongest_paths_tiled_cpu_simd[tile_size: Int = DEFAULT_CPU_TILE_SIZE](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
+
+def compute_strongest_paths_tiled_cpu_simd[
+    tile_size: Int = DEFAULT_CPU_TILE_SIZE
+](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
     """
     SIMD-vectorized tiled CPU implementation of Schulze strongest paths computation.
     Uses phase-specific SIMD tile processors for optimal vectorization and minimal branching.
@@ -636,19 +801,19 @@ fn compute_strongest_paths_tiled_cpu_simd[tile_size: Int = DEFAULT_CPU_TILE_SIZE
         StrongestPathsMatrix with computed strongest paths.
     """
     # Use largest power-of-2 SIMD width (up to 16 for AVX-512) that divides tile_size
-    alias simd_width = (
-        16 if tile_size % 16 == 0 else
-        8 if tile_size % 8 == 0 else
-        4 if tile_size % 4 == 0 else
-        2 if tile_size % 2 == 0 else
-        1
+    comptime simd_width = (
+        16 if tile_size % 16
+        == 0 else 8 if tile_size % 8
+        == 0 else 4 if tile_size % 4
+        == 0 else 2 if tile_size % 2
+        == 0 else 1
     )
     var num_candidates = preferences.num_candidates
     var strongest_paths = StrongestPathsMatrix(num_candidates)
 
     # Step 1: Initialize strongest paths (same as regular CPU version)
     @parameter
-    fn init_paths(i: Int):
+    def init_paths(i: Int):
         for j in range(num_candidates):
             if i != j:
                 var pref_ij = preferences[i, j]
@@ -664,81 +829,157 @@ fn compute_strongest_paths_tiled_cpu_simd[tile_size: Int = DEFAULT_CPU_TILE_SIZE
     var num_tiles = (num_candidates + tile_size - 1) // tile_size
 
     for k in range(num_tiles):
+        var k_index = k
         var k_bounds = calculate_tile_bounds(k, tile_size, num_candidates)
         var k_start = k_bounds[0]
 
         # Diagonal phase: uses diagonal-aware SIMD processor
-        var diagonal_tile = stack_allocation[tile_size * tile_size, UInt32]()
-        memset_zero(diagonal_tile, tile_size * tile_size)
+        var diagonal_tile = stack_allocation[
+            tile_size * tile_size, UInt32, alignment=64
+        ]()
+        unsafe_memset_zero(diagonal_tile, tile_size * tile_size)
 
         copy_tile_to_buffer(
-            strongest_paths.data, diagonal_tile,
-            k_start, k_start, tile_size, num_candidates
+            strongest_paths.data,
+            diagonal_tile,
+            k_start,
+            k_start,
+            tile_size,
+            num_candidates,
         )
 
         process_tile_cpu_simd_diagonal[tile_size, simd_width](
-            diagonal_tile, diagonal_tile, diagonal_tile,
-            k_start, k_start, k_start,
-            num_candidates, tile_size
+            diagonal_tile,
+            diagonal_tile,
+            diagonal_tile,
+            k_start,
+            k_start,
+            k_start,
+            num_candidates,
+            tile_size,
         )
 
         copy_buffer_to_tile(
-            diagonal_tile, strongest_paths.data,
-            k_start, k_start, tile_size, num_candidates
+            diagonal_tile,
+            strongest_paths.data,
+            k_start,
+            k_start,
+            tile_size,
+            num_candidates,
         )
 
         # Partially dependent phases - row and column tiles
         @parameter
-        fn process_row_col_tiles(i: Int):
-            if i == k:
+        def process_row_col_tiles(i: Int):
+            if i == k_index:
                 return
 
             var i_bounds = calculate_tile_bounds(i, tile_size, num_candidates)
             var i_start = i_bounds[0]
 
             # Row tile (i, k)
-            var c_tile_row = stack_allocation[tile_size * tile_size, UInt32]()
-            var b_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile_row, tile_size * tile_size)
-            memset_zero(b_tile, tile_size * tile_size)
+            var c_tile_row = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var b_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile_row, tile_size * tile_size)
+            unsafe_memset_zero(b_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile_row, i_start, k_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, b_tile, k_start, k_start, tile_size, num_candidates)
-
-            process_tile_cpu_simd_diagonal[tile_size, simd_width](
-                c_tile_row, c_tile_row, b_tile,
-                i_start, k_start, k_start,
-                num_candidates, tile_size
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile_row,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                b_tile,
+                k_start,
+                k_start,
+                tile_size,
+                num_candidates,
             )
 
-            copy_buffer_to_tile(c_tile_row, strongest_paths.data, i_start, k_start, tile_size, num_candidates)
+            process_tile_cpu_simd_diagonal[tile_size, simd_width](
+                c_tile_row,
+                c_tile_row,
+                b_tile,
+                i_start,
+                k_start,
+                k_start,
+                num_candidates,
+                tile_size,
+            )
+
+            copy_buffer_to_tile(
+                c_tile_row,
+                strongest_paths.data,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
 
             # Column tile (k, i)
-            var c_tile_col = stack_allocation[tile_size * tile_size, UInt32]()
-            var a_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile_col, tile_size * tile_size)
-            memset_zero(a_tile, tile_size * tile_size)
+            var c_tile_col = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var a_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile_col, tile_size * tile_size)
+            unsafe_memset_zero(a_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile_col, k_start, i_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, a_tile, k_start, k_start, tile_size, num_candidates)
-
-            process_tile_cpu_simd_diagonal[tile_size, simd_width](
-                c_tile_col, a_tile, c_tile_col,
-                k_start, i_start, k_start,
-                num_candidates, tile_size
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile_col,
+                k_start,
+                i_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                a_tile,
+                k_start,
+                k_start,
+                tile_size,
+                num_candidates,
             )
 
-            copy_buffer_to_tile(c_tile_col, strongest_paths.data, k_start, i_start, tile_size, num_candidates)
+            process_tile_cpu_simd_diagonal[tile_size, simd_width](
+                c_tile_col,
+                a_tile,
+                c_tile_col,
+                k_start,
+                i_start,
+                k_start,
+                num_candidates,
+                tile_size,
+            )
+
+            copy_buffer_to_tile(
+                c_tile_col,
+                strongest_paths.data,
+                k_start,
+                i_start,
+                tile_size,
+                num_candidates,
+            )
 
         parallelize[process_row_col_tiles](num_tiles)
 
         # Independent phase: uses fast SIMD processor (no diagonal checks)
         @parameter
-        fn process_independent_tiles(idx: Int):
+        def process_independent_tiles(idx: Int):
             var i = idx // num_tiles
             var j = idx % num_tiles
 
-            if i == k or j == k:
+            if i == k_index or j == k_index:
                 return
 
             var i_bounds = calculate_tile_bounds(i, tile_size, num_candidates)
@@ -747,37 +988,83 @@ fn compute_strongest_paths_tiled_cpu_simd[tile_size: Int = DEFAULT_CPU_TILE_SIZE
             var j_bounds = calculate_tile_bounds(j, tile_size, num_candidates)
             var j_start = j_bounds[0]
 
-            var c_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var a_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            var b_tile = stack_allocation[tile_size * tile_size, UInt32]()
-            memset_zero(c_tile, tile_size * tile_size)
-            memset_zero(a_tile, tile_size * tile_size)
-            memset_zero(b_tile, tile_size * tile_size)
+            var c_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var a_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            var b_tile = stack_allocation[
+                tile_size * tile_size, UInt32, alignment=64
+            ]()
+            unsafe_memset_zero(c_tile, tile_size * tile_size)
+            unsafe_memset_zero(a_tile, tile_size * tile_size)
+            unsafe_memset_zero(b_tile, tile_size * tile_size)
 
-            copy_tile_to_buffer(strongest_paths.data, c_tile, i_start, j_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, a_tile, i_start, k_start, tile_size, num_candidates)
-            copy_tile_to_buffer(strongest_paths.data, b_tile, k_start, j_start, tile_size, num_candidates)
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                c_tile,
+                i_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                a_tile,
+                i_start,
+                k_start,
+                tile_size,
+                num_candidates,
+            )
+            copy_tile_to_buffer(
+                strongest_paths.data,
+                b_tile,
+                k_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
 
             # Use independent processor if not on diagonal, otherwise use diagonal processor
             if i == j:
                 process_tile_cpu_simd_diagonal[tile_size, simd_width](
-                    c_tile, a_tile, b_tile,
-                    i_start, j_start, k_start,
-                    num_candidates, tile_size
+                    c_tile,
+                    a_tile,
+                    b_tile,
+                    i_start,
+                    j_start,
+                    k_start,
+                    num_candidates,
+                    tile_size,
                 )
             else:
                 process_tile_cpu_simd_independent[tile_size, simd_width](
-                    c_tile, a_tile, b_tile,
-                    tile_size
+                    c_tile, a_tile, b_tile, tile_size
                 )
 
-            copy_buffer_to_tile(c_tile, strongest_paths.data, i_start, j_start, tile_size, num_candidates)
+            copy_buffer_to_tile(
+                c_tile,
+                strongest_paths.data,
+                i_start,
+                j_start,
+                tile_size,
+                num_candidates,
+            )
 
         parallelize[process_independent_tiles](num_tiles * num_tiles)
 
     return strongest_paths^
 
-fn compute_election_results(strongest_paths: StrongestPathsMatrix) -> (Int, List[Int]):
+
+# endregion CPU Drivers
+
+# region Results
+
+
+def compute_election_results(
+    strongest_paths: StrongestPathsMatrix,
+) -> Tuple[Int, List[Int]]:
     """
     Determines the winner and ranking based on strongest paths matrix.
 
@@ -822,7 +1109,15 @@ fn compute_election_results(strongest_paths: StrongestPathsMatrix) -> (Int, List
 
     return (winner_idx, ranking^)
 
-fn generate_random_preferences(num_candidates: Int, num_voters: Int) -> PreferenceMatrix:
+
+# endregion Results
+
+# region Benchmarking
+
+
+def generate_random_preferences(
+    num_candidates: Int, num_voters: Int
+) -> PreferenceMatrix:
     """
     Generates random preference matrix for testing.
 
@@ -837,10 +1132,13 @@ fn generate_random_preferences(num_candidates: Int, num_voters: Int) -> Preferen
 
     # Fast path: directly generate random preference matrix (parallelized)
     if num_voters == 0:
+
         @parameter
-        fn fill_row(i: Int):
+        def fill_row(i: Int):
             for j in range(num_candidates):
-                preferences[i, j] = UInt32(random_si64(0, num_candidates))
+                preferences[i, j] = UInt32(
+                    random_si64(0, Int64(num_candidates - 1))
+                )
 
         parallelize[fill_row](num_candidates)
         return preferences^
@@ -857,7 +1155,7 @@ fn generate_random_preferences(num_candidates: Int, num_voters: Int) -> Preferen
 
         # Fisher-Yates shuffle
         for i in range(num_candidates - 1, 0, -1):
-            var j = Int(random_si64(0, i + 1))
+            var j = Int(random_si64(0, Int64(i)))
             var temp = ranking[i]
             ranking[i] = ranking[j]
             ranking[j] = temp
@@ -866,28 +1164,35 @@ fn generate_random_preferences(num_candidates: Int, num_voters: Int) -> Preferen
 
     return preferences^
 
-fn run_warmup(
-    implementation: fn(PreferenceMatrix) raises -> StrongestPathsMatrix,
-    preferences: PreferenceMatrix,
-    warmup: Int
-) raises:
+
+def run_warmup[
+    implementation: def(PreferenceMatrix) raises thin -> StrongestPathsMatrix
+](preferences: PreferenceMatrix, warmup: Int) raises:
     """Run warmup iterations and print timing."""
     for i in range(warmup):
         var start_time = perf_counter_ns()
         _ = implementation(preferences)
         var elapsed_ns = perf_counter_ns() - start_time
         if warmup > 1:
-            print("  Warm-up " + String(i+1) + "/" + String(warmup) + ": " + format_time(elapsed_ns))
+            print(
+                "  Warm-up "
+                + String(i + 1)
+                + "/"
+                + String(warmup)
+                + ": "
+                + format_time(elapsed_ns)
+            )
         else:
             print("  Warm-up: " + format_time(elapsed_ns))
 
-fn measure_and_average(
-    implementation: fn(PreferenceMatrix) raises -> StrongestPathsMatrix,
-    preferences: PreferenceMatrix,
-    repeat: Int,
-    mut result: StrongestPathsMatrix
+
+def measure_and_average[
+    implementation: def(PreferenceMatrix) raises thin -> StrongestPathsMatrix
+](
+    preferences: PreferenceMatrix, repeat: Int, mut result: StrongestPathsMatrix
 ) raises -> Int:
-    """Run benchmark iterations and return avg_time_ns, storing result in mutable parameter."""
+    """Run benchmark iterations and return avg_time_ns, storing result in mutable parameter.
+    """
     var times = List[Int]()
     for _ in range(repeat):
         var start_time = perf_counter_ns()
@@ -902,16 +1207,18 @@ fn measure_and_average(
     var avg_time = total_time // repeat
     return avg_time
 
-fn profile_and_report(
+
+def profile_and_report[
+    implementation: def(PreferenceMatrix) raises thin -> StrongestPathsMatrix
+](
     label: String,
-    implementation: fn(PreferenceMatrix) raises -> StrongestPathsMatrix,
     preferences: PreferenceMatrix,
     warmup: Int,
     repeat: Int,
     num_candidates: Int,
     has_baseline: Bool,
-    baseline: StrongestPathsMatrix
-) raises -> (Bool, Int, List[Int]):
+    baseline: StrongestPathsMatrix,
+) raises -> Tuple[Bool, Int, List[Int]]:
     """
     Profile an implementation's performance and report results with validation.
     Returns (success, winner_idx, ranking) tuple.
@@ -919,17 +1226,31 @@ fn profile_and_report(
     print("→ " + label)
 
     # Warmup
-    run_warmup(implementation, preferences, warmup)
+    run_warmup[implementation](preferences, warmup)
 
     # Benchmark
     var result = StrongestPathsMatrix(0)
-    var avg_time = measure_and_average(implementation, preferences, repeat, result)
+    var avg_time = measure_and_average[implementation](
+        preferences, repeat, result
+    )
 
     # Print results
     if repeat > 1:
-        print("  Run:     " + format_time(avg_time) + " (avg of " + String(repeat) + ") │ " + format_throughput_from_ns(avg_time, num_candidates))
+        print(
+            "  Run:     "
+            + format_time(avg_time)
+            + " (avg of "
+            + String(repeat)
+            + ") │ "
+            + format_throughput_from_ns(avg_time, num_candidates)
+        )
     else:
-        print("  Run:     " + format_time(avg_time) + " │ " + format_throughput_from_ns(avg_time, num_candidates))
+        print(
+            "  Run:     "
+            + format_time(avg_time)
+            + " │ "
+            + format_throughput_from_ns(avg_time, num_candidates)
+        )
 
     # Validate
     if has_baseline and validate_against_baseline(result, baseline):
@@ -945,7 +1266,8 @@ fn profile_and_report(
     print()
     return (True, winner_idx, winner_ranking^)
 
-fn format_time(elapsed_ns: Int) -> String:
+
+def format_time(elapsed_ns: Int) -> String:
     """Format time with appropriate unit (ms or s)."""
     var elapsed_ms = elapsed_ns // 1_000_000
     if elapsed_ms < 1000:
@@ -953,9 +1275,16 @@ fn format_time(elapsed_ns: Int) -> String:
     else:
         var elapsed_sec = Float64(elapsed_ns) / 1_000_000_000.0
         var sec_x100 = Int(elapsed_sec * 100.0)
-        return String(sec_x100 // 100) + "." + String((sec_x100 % 100) // 10) + String(sec_x100 % 10) + " s"
+        return (
+            String(sec_x100 // 100)
+            + "."
+            + String((sec_x100 % 100) // 10)
+            + String(sec_x100 % 10)
+            + " s"
+        )
 
-fn format_throughput(cells_per_sec: Float64) -> String:
+
+def format_throughput(cells_per_sec: Float64) -> String:
     """Format throughput with appropriate unit (T/G/M cells³/s)."""
     if cells_per_sec >= 1e12:
         var t_x10 = Int(cells_per_sec / 1e11)
@@ -970,7 +1299,8 @@ fn format_throughput(cells_per_sec: Float64) -> String:
         var k_x10 = Int(cells_per_sec / 1e2)
         return String(k_x10 // 10) + "." + String(k_x10 % 10) + " Kcells³/s"
 
-fn format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
+
+def format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
     """Calculate and format throughput from timing."""
     if elapsed_ns <= 0:
         return "N/A"
@@ -982,6 +1312,7 @@ fn format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
     var cells_per_sec = total_cells / elapsed_sec
     return format_throughput(cells_per_sec)
 
+
 # =============================================================================
 # PURE MOJO GPU KERNELS FOR SCHULZE VOTING ALGORITHM
 # =============================================================================
@@ -990,18 +1321,28 @@ fn format_throughput_from_ns(elapsed_ns: Int, num_candidates: Int) -> String:
 # Matching the CUDA reference in scaling_elections.cu
 # =============================================================================
 
-alias SharedUInt32Ptr = UnsafePointer[UInt32, address_space=AddressSpace(3)]
+# endregion Benchmarking
+
+# region GPU Kernels
+
+comptime SharedUInt32Ptr = Pointer[
+    UInt32, MutUntrackedOrigin, address_space=AddressSpace.SHARED
+]
+
 
 @always_inline
-fn process_tile_gpu_device[
+def process_tile_gpu_device[
     tile_size: Int, may_be_diagonal: Bool, synchronize: Bool
 ](
     c_shared: SharedUInt32Ptr,
     a_shared: SharedUInt32Ptr,
     b_shared: SharedUInt32Ptr,
-    c_row: Int, c_col: Int,
-    a_row: Int, a_col: Int,
-    b_row: Int, b_col: Int
+    c_row: Int,
+    c_col: Int,
+    a_row: Int,
+    a_col: Int,
+    b_row: Int,
+    b_col: Int,
 ):
     """
     Core tile processing logic for GPU - runs on each thread.
@@ -1014,7 +1355,7 @@ fn process_tile_gpu_device[
     var c_idx = bi * tile_size + bj
 
     # Each thread processes one cell of the output tile
-    var c_val = c_shared[c_idx]
+    var c_val = c_shared[unsafe_offset=c_idx]
 
     # Floyd-Warshall inner loop over k
     for k in range(tile_size):
@@ -1023,22 +1364,32 @@ fn process_tile_gpu_device[
         var a_idx = bi * tile_size + k
         var b_idx = k * tile_size + bj
 
-        var a_val = a_shared[a_idx]
-        var b_val = b_shared[b_idx]
+        var a_val = a_shared[unsafe_offset=a_idx]
+        var b_val = b_shared[unsafe_offset=b_idx]
         var smallest = min(a_val, b_val)
 
-        @parameter
-        if may_be_diagonal:
+        comptime if may_be_diagonal:
             # Compute global indices
             var global_i = c_row + bi
             var global_j = c_col + bj
 
             # Diagonal avoidance using branchless bit operations
-            var is_not_diagonal_c = UInt32(1) if global_i != global_j else UInt32(0)
-            var is_not_diagonal_a = UInt32(1) if global_i != global_k else UInt32(0)
-            var is_not_diagonal_b = UInt32(1) if global_k != global_j else UInt32(0)
+            var is_not_diagonal_c = UInt32(
+                1
+            ) if global_i != global_j else UInt32(0)
+            var is_not_diagonal_a = UInt32(
+                1
+            ) if global_i != global_k else UInt32(0)
+            var is_not_diagonal_b = UInt32(
+                1
+            ) if global_k != global_j else UInt32(0)
             var is_bigger = UInt32(1) if smallest > c_val else UInt32(0)
-            var will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger
+            var will_replace = (
+                is_not_diagonal_c
+                & is_not_diagonal_a
+                & is_not_diagonal_b
+                & is_bigger
+            )
 
             if will_replace == 1:
                 c_val = smallest
@@ -1049,22 +1400,22 @@ fn process_tile_gpu_device[
         # Write back IMMEDIATELY after update - critical for correctness!
         # When a_shared/b_shared/c_shared point to the same buffer (diagonal phase),
         # threads must see updated values from previous k iterations.
-        c_shared[c_idx] = c_val
+        c_shared[unsafe_offset=c_idx] = c_val
 
         # Synchronize after each k iteration when needed (for diagonal/shared tiles)
-        @parameter
-        if synchronize:
+        comptime if synchronize:
             barrier()
 
-fn gpu_diagonal_kernel[tile_size: Int](
-    graph: UnsafePointer[UInt32],
-    n: Int,
-    k: Int
-):
+
+def gpu_diagonal_kernel[
+    tile_size: Int
+](graph: Pointer[UInt32, MutUntrackedOrigin], n_arg: Int32, k_arg: Int32):
     """
     GPU kernel for diagonal phase - processes tile (k, k).
     Matches cuda_diagonal_ from CUDA implementation.
     """
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     var bi = Int(thread_idx.y)
     var bj = Int(thread_idx.x)
 
@@ -1072,40 +1423,50 @@ fn gpu_diagonal_kernel[tile_size: Int](
     var c_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
 
     # Load tile from global memory
-    var global_idx = k * tile_size * n + k * tile_size + bi * n + bj
-    c_shared[bi * tile_size + bj] = graph[global_idx]
+    var flat_index = k * tile_size * n + k * tile_size + bi * n + bj
+    c_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=flat_index
+    ]
 
     # Synchronize after load
     barrier()
 
     # Process tile (all three inputs are the same tile, need synchronization)
     process_tile_gpu_device[tile_size, True, True](
-        c_shared, c_shared, c_shared,
-        tile_size * k, tile_size * k,
-        tile_size * k, tile_size * k,
-        tile_size * k, tile_size * k
+        c_shared,
+        c_shared,
+        c_shared,
+        tile_size * k,
+        tile_size * k,
+        tile_size * k,
+        tile_size * k,
+        tile_size * k,
+        tile_size * k,
     )
 
     # Synchronize before store
     barrier()
 
     # Write back to global memory
-    graph[global_idx] = c_shared[bi * tile_size + bj]
+    graph[unsafe_offset=flat_index] = c_shared[
+        unsafe_offset=bi * tile_size + bj
+    ]
 
-fn gpu_partially_independent_kernel[tile_size: Int](
-    graph: UnsafePointer[UInt32],
-    n: Int,
-    k: Int
-):
+
+def gpu_partially_independent_kernel[
+    tile_size: Int
+](graph: Pointer[UInt32, MutUntrackedOrigin], n_arg: Int32, k_arg: Int32):
     """
     GPU kernel for partially independent phase.
     Processes row and column tiles relative to diagonal tile k.
     Matches cuda_partially_independent_ from CUDA.
     """
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     var i = Int(block_idx.x)
     var bi = Int(thread_idx.y)
     var bj = Int(thread_idx.x)
@@ -1117,66 +1478,89 @@ fn gpu_partially_independent_kernel[tile_size: Int](
     var a_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
     var b_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
     var c_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
 
     # Phase 1: Process row tile (i, k) using (i, k) and (k, k)
-    # Load c[i,k] and b[k,k]
-    c_shared[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj]
-    b_shared[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj]
+    # Load c[unsafe_offset=i,k] and b[unsafe_offset=k,k]
+    c_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=i * tile_size * n + k * tile_size + bi * n + bj
+    ]
+    b_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=k * tile_size * n + k * tile_size + bi * n + bj
+    ]
 
     barrier()
 
     process_tile_gpu_device[tile_size, True, True](
-        c_shared, c_shared, b_shared,
-        i * tile_size, k * tile_size,
-        i * tile_size, k * tile_size,
-        k * tile_size, k * tile_size
+        c_shared,
+        c_shared,
+        b_shared,
+        i * tile_size,
+        k * tile_size,
+        i * tile_size,
+        k * tile_size,
+        k * tile_size,
+        k * tile_size,
     )
 
     barrier()
 
     # Store phase 1 result
-    graph[i * tile_size * n + k * tile_size + bi * n + bj] = c_shared[bi * tile_size + bj]
+    graph[
+        unsafe_offset=i * tile_size * n + k * tile_size + bi * n + bj
+    ] = c_shared[unsafe_offset=bi * tile_size + bj]
 
     # Phase 2: Process column tile (k, i) using (k, k) and (k, i)
-    # Load c[k,i] and a[k,k]
-    c_shared[bi * tile_size + bj] = graph[k * tile_size * n + i * tile_size + bi * n + bj]
-    a_shared[bi * tile_size + bj] = graph[k * tile_size * n + k * tile_size + bi * n + bj]
+    # Load c[unsafe_offset=k,i] and a[unsafe_offset=k,k]
+    c_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=k * tile_size * n + i * tile_size + bi * n + bj
+    ]
+    a_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=k * tile_size * n + k * tile_size + bi * n + bj
+    ]
 
     barrier()
 
     process_tile_gpu_device[tile_size, True, True](
-        c_shared, a_shared, c_shared,
-        k * tile_size, i * tile_size,
-        k * tile_size, k * tile_size,
-        k * tile_size, i * tile_size
+        c_shared,
+        a_shared,
+        c_shared,
+        k * tile_size,
+        i * tile_size,
+        k * tile_size,
+        k * tile_size,
+        k * tile_size,
+        i * tile_size,
     )
 
     barrier()
 
     # Store phase 2 result
-    graph[k * tile_size * n + i * tile_size + bi * n + bj] = c_shared[bi * tile_size + bj]
+    graph[
+        unsafe_offset=k * tile_size * n + i * tile_size + bi * n + bj
+    ] = c_shared[unsafe_offset=bi * tile_size + bj]
 
-fn gpu_independent_kernel[tile_size: Int](
-    graph: UnsafePointer[UInt32],
-    n: Int,
-    k: Int
-):
+
+def gpu_independent_kernel[
+    tile_size: Int
+](graph: Pointer[UInt32, MutUntrackedOrigin], n_arg: Int32, k_arg: Int32):
     """
     GPU kernel for independent phase - processes all tiles except row/column k.
     Matches cuda_independent_ from CUDA implementation.
     """
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     var j = Int(block_idx.x)
     var i = Int(block_idx.y)
     var bi = Int(thread_idx.y)
@@ -1189,48 +1573,74 @@ fn gpu_independent_kernel[tile_size: Int](
     var a_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
     var b_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
     var c_shared = stack_allocation[
         tile_size * tile_size,
         UInt32,
-        address_space=AddressSpace(3),
+        address_space=AddressSpace.SHARED,
     ]()
 
-    # Load three tiles: c[i,j], a[i,k], b[k,j]
-    c_shared[bi * tile_size + bj] = graph[i * tile_size * n + j * tile_size + bi * n + bj]
-    a_shared[bi * tile_size + bj] = graph[i * tile_size * n + k * tile_size + bi * n + bj]
-    b_shared[bi * tile_size + bj] = graph[k * tile_size * n + j * tile_size + bi * n + bj]
+    # Load three tiles: c[unsafe_offset=i,j], a[unsafe_offset=i,k], b[unsafe_offset=k,j]
+    c_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=i * tile_size * n + j * tile_size + bi * n + bj
+    ]
+    a_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=i * tile_size * n + k * tile_size + bi * n + bj
+    ]
+    b_shared[unsafe_offset=bi * tile_size + bj] = graph[
+        unsafe_offset=k * tile_size * n + j * tile_size + bi * n + bj
+    ]
 
     barrier()
 
     # Process tile - use diagonal check if i == j, no synchronization needed (different tiles)
     if i == j:
         process_tile_gpu_device[tile_size, True, False](
-            c_shared, a_shared, b_shared,
-            i * tile_size, j * tile_size,
-            i * tile_size, k * tile_size,
-            k * tile_size, j * tile_size
+            c_shared,
+            a_shared,
+            b_shared,
+            i * tile_size,
+            j * tile_size,
+            i * tile_size,
+            k * tile_size,
+            k * tile_size,
+            j * tile_size,
         )
     else:
         process_tile_gpu_device[tile_size, False, False](
-            c_shared, a_shared, b_shared,
-            i * tile_size, j * tile_size,
-            i * tile_size, k * tile_size,
-            k * tile_size, j * tile_size
+            c_shared,
+            a_shared,
+            b_shared,
+            i * tile_size,
+            j * tile_size,
+            i * tile_size,
+            k * tile_size,
+            k * tile_size,
+            j * tile_size,
         )
 
     # No barrier needed - independent tiles write to different locations
 
     # Write back result
-    graph[i * tile_size * n + j * tile_size + bi * n + bj] = c_shared[bi * tile_size + bj]
+    graph[
+        unsafe_offset=i * tile_size * n + j * tile_size + bi * n + bj
+    ] = c_shared[unsafe_offset=bi * tile_size + bj]
 
-fn compute_strongest_paths_gpu[tile_size: Int = DEFAULT_GPU_TILE_SIZE](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
+
+# endregion GPU Kernels
+
+# region GPU Driver
+
+
+def compute_strongest_paths_gpu[
+    tile_size: Int = DEFAULT_GPU_TILE_SIZE
+](preferences: PreferenceMatrix) raises -> StrongestPathsMatrix:
     """
     Pure Mojo GPU implementation of Schulze strongest paths computation.
 
@@ -1251,7 +1661,7 @@ fn compute_strongest_paths_gpu[tile_size: Int = DEFAULT_GPU_TILE_SIZE](preferenc
 
     # Step 1: Initialize result matrix on CPU (parallelized)
     @parameter
-    fn init_paths(i: Int):
+    def init_paths(i: Int):
         for j in range(num_candidates):
             if i != j:
                 var pref_ij = preferences[i, j]
@@ -1273,7 +1683,7 @@ fn compute_strongest_paths_gpu[tile_size: Int = DEFAULT_GPU_TILE_SIZE](preferenc
 
     # Step 4: Copy initialized data to host buffer
     for i in range(matrix_size):
-        host_graph[i] = result.data[i]
+        host_graph[i] = result.data[unsafe_offset=i]
 
     # Step 5: Copy from host buffer to device buffer
     host_graph.enqueue_copy_to(device_graph)
@@ -1289,23 +1699,29 @@ fn compute_strongest_paths_gpu[tile_size: Int = DEFAULT_GPU_TILE_SIZE](preferenc
     for k in range(num_tiles):
         # Phase 1: Diagonal tile (sequential, 1 block)
         ctx.enqueue_function[gpu_diagonal_kernel[tile_size]](
-            graph_ptr, num_candidates, k,
+            graph_ptr,
+            Int32(num_candidates),
+            Int32(k),
             grid_dim=(1, 1, 1),
-            block_dim=block_dim_tuple
+            block_dim=block_dim_tuple,
         )
 
         # Phase 2: Partially independent tiles (num_tiles blocks)
         ctx.enqueue_function[gpu_partially_independent_kernel[tile_size]](
-            graph_ptr, num_candidates, k,
+            graph_ptr,
+            Int32(num_candidates),
+            Int32(k),
             grid_dim=(num_tiles, 1, 1),
-            block_dim=block_dim_tuple
+            block_dim=block_dim_tuple,
         )
 
         # Phase 3: Independent tiles (num_tiles x num_tiles blocks)
         ctx.enqueue_function[gpu_independent_kernel[tile_size]](
-            graph_ptr, num_candidates, k,
+            graph_ptr,
+            Int32(num_candidates),
+            Int32(k),
             grid_dim=(num_tiles, num_tiles, 1),
-            block_dim=block_dim_tuple
+            block_dim=block_dim_tuple,
         )
 
         # Synchronize after each k iteration
@@ -1320,11 +1736,19 @@ fn compute_strongest_paths_gpu[tile_size: Int = DEFAULT_GPU_TILE_SIZE](preferenc
 
     # Copy from host buffer to result
     for i in range(matrix_size):
-        result.data[i] = UInt32(host_graph[i])
+        result.data[unsafe_offset=i] = UInt32(host_graph[i])
 
     return result^
 
-fn validate_against_baseline(result: StrongestPathsMatrix, baseline: StrongestPathsMatrix) -> Bool:
+
+# endregion GPU Driver
+
+# region Command Line
+
+
+def validate_against_baseline(
+    result: StrongestPathsMatrix, baseline: StrongestPathsMatrix
+) -> Bool:
     """Check if two results match."""
     var n = result.num_candidates
     for i in range(n):
@@ -1333,48 +1757,80 @@ fn validate_against_baseline(result: StrongestPathsMatrix, baseline: StrongestPa
                 return False
     return True
 
-fn parse_int_arg[origin: Origin](args: VariadicList[StringSlice[origin]], flag: String, default: Int) -> Int:
+
+def parse_int_arg(
+    args: Span[StaticString, ImmStaticOrigin], flag: String, default: Int
+) -> Int:
     """Parse an integer command-line argument."""
     for i in range(len(args)):
-        if args[i] == flag and i + 1 < len(args):
+        if String(args[i]) == flag and i + 1 < len(args):
             try:
-                return atol(args[i + 1])
+                return Int(String(args[i + 1]))
             except:
-                print("Warning: Invalid value for", flag, "- using default:", default)
+                print(
+                    "Warning: Invalid value for",
+                    flag,
+                    "- using default:",
+                    default,
+                )
                 return default
     return default
 
-fn has_flag[origin: Origin](args: VariadicList[StringSlice[origin]], flag: String) -> Bool:
+
+def has_flag(args: Span[StaticString, ImmStaticOrigin], flag: String) -> Bool:
     """Check if a flag exists in command-line arguments."""
     for i in range(len(args)):
-        if args[i] == flag:
+        if String(args[i]) == flag:
             return True
     return False
 
-fn print_usage():
+
+def print_usage():
     """Print usage information."""
     print("Usage: mojo scaling_elections.mojo [OPTIONS]")
     print()
     print("Options:")
     print("  --num-candidates N    Number of candidates (default: 128)")
     print("  --num-voters N        Number of voters (default: 2000)")
-    print("                        Set to 0 for instant random preference matrix generation")
-    print("  --run-cpu             Run CPU implementations (tiled + SIMD-vectorized)")
+    print(
+        "                        Set to 0 for instant random preference matrix"
+        " generation"
+    )
+    print(
+        "  --run-cpu             Run CPU implementations (tiled +"
+        " SIMD-vectorized)"
+    )
     print("  --run-gpu             Run GPU implementation")
     print("  --no-serial           Skip serial baseline")
-    print("  --cpu-tile-size N     CPU tile size: 4, 8, 12, 16, 24, 32, 48, 64, 96, 128 (default: 16)")
-    print("  --gpu-tile-size N     GPU tile size: 4, 8, 12, 16, 24, 32, 48, 64 (default: 32)")
+    print(
+        "  --cpu-tile-size N     CPU tile size: 4, 8, 12, 16, 24, 32, 48, 64,"
+        " 96, 128 (default: 16)"
+    )
+    print(
+        "  --gpu-tile-size N     GPU tile size: 4, 8, 12, 16, 24, 32, 48, 64"
+        " (default: 32)"
+    )
     print("  --warmup N            Number of warmup iterations (default: 1)")
     print("  --repeat N            Number of benchmark iterations (default: 1)")
     print("  --help, -h            Show this help message")
     print()
     print("Examples:")
-    print("  pixi run mojo scaling_elections.mojo --num-candidates 256 --num-voters 4000")
-    print("  pixi run mojo scaling_elections.mojo --num-candidates 4096 --run-cpu --run-gpu")
-    print("  pixi run mojo scaling_elections.mojo --num-candidates 16384 --num-voters 0 --run-gpu --no-serial")
+    print(
+        "  pixi run mojo scaling_elections.mojo --num-candidates 256"
+        " --num-voters 4000"
+    )
+    print(
+        "  pixi run mojo scaling_elections.mojo --num-candidates 4096 --run-cpu"
+        " --run-gpu"
+    )
+    print(
+        "  pixi run mojo scaling_elections.mojo --num-candidates 16384"
+        " --num-voters 0 --run-gpu --no-serial"
+    )
     print("  pixi run mojo scaling_elections.mojo --run-cpu --cpu-tile-size 32")
 
-fn main():
+
+def main():
     """
     Main function demonstrating the Schulze voting algorithm.
     Tests CPU and GPU implementations with performance benchmarking.
@@ -1390,8 +1846,12 @@ fn main():
     # Parse command-line arguments
     var num_candidates = parse_int_arg(args, "--num-candidates", 128)
     var num_voters = parse_int_arg(args, "--num-voters", 2000)
-    var cpu_tile_size = parse_int_arg(args, "--cpu-tile-size", DEFAULT_CPU_TILE_SIZE)
-    var gpu_tile_size = parse_int_arg(args, "--gpu-tile-size", DEFAULT_GPU_TILE_SIZE)
+    var cpu_tile_size = parse_int_arg(
+        args, "--cpu-tile-size", DEFAULT_CPU_TILE_SIZE
+    )
+    var gpu_tile_size = parse_int_arg(
+        args, "--gpu-tile-size", DEFAULT_GPU_TILE_SIZE
+    )
     var warmup = parse_int_arg(args, "--warmup", 1)
     var repeat = parse_int_arg(args, "--repeat", 1)
     var run_cpu = has_flag(args, "--run-cpu")
@@ -1410,13 +1870,25 @@ fn main():
 
     # Validate CPU tile size
     if cpu_tile_size not in ALLOWED_CPU_TILE_SIZES:
-        print("Warning: --cpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, 64, 96, or 128. Using default:", DEFAULT_CPU_TILE_SIZE)
+        print(
+            (
+                "Warning: --cpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, 64,"
+                " 96, or 128. Using default:"
+            ),
+            DEFAULT_CPU_TILE_SIZE,
+        )
         cpu_tile_size = DEFAULT_CPU_TILE_SIZE
         print()
 
     # Validate GPU tile size
     if run_gpu and gpu_tile_size not in ALLOWED_GPU_TILE_SIZES:
-        print("Warning: --gpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, or 64. Using default:", DEFAULT_GPU_TILE_SIZE)
+        print(
+            (
+                "Warning: --gpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, or"
+                " 64. Using default:"
+            ),
+            DEFAULT_GPU_TILE_SIZE,
+        )
         gpu_tile_size = DEFAULT_GPU_TILE_SIZE
         print()
 
@@ -1426,11 +1898,25 @@ fn main():
         return
 
     print("Configuration:")
-    var voters_str = String(num_voters) + " voters" if num_voters > 0 else "random"
-    print("  Problem size: " + String(num_candidates) + " candidates × " + voters_str)
-    print("  CPU tile: " + String(cpu_tile_size) + " × " + String(cpu_tile_size))
+    var voters_str = (
+        String(num_voters) + " voters" if num_voters > 0 else "random"
+    )
+    print(
+        "  Problem size: "
+        + String(num_candidates)
+        + " candidates × "
+        + voters_str
+    )
+    print(
+        "  CPU tile: " + String(cpu_tile_size) + " × " + String(cpu_tile_size)
+    )
     if run_gpu:
-        print("  GPU tile: " + String(gpu_tile_size) + " × " + String(gpu_tile_size))
+        print(
+            "  GPU tile: "
+            + String(gpu_tile_size)
+            + " × "
+            + String(gpu_tile_size)
+        )
     print("  Warmup: " + String(warmup) + ", Repeat: " + String(repeat))
     print()
 
@@ -1455,14 +1941,28 @@ fn main():
     if run_serial:
         try:
             print("→ Serial (Mojo)")
-            run_warmup(compute_strongest_paths_serial, preferences, warmup)
+            run_warmup[compute_strongest_paths_serial](preferences, warmup)
 
-            var avg_time = measure_and_average(compute_strongest_paths_serial, preferences, repeat, baseline)
+            var avg_time = measure_and_average[compute_strongest_paths_serial](
+                preferences, repeat, baseline
+            )
 
             if repeat > 1:
-                print("  Run:     " + format_time(avg_time) + " (avg of " + String(repeat) + ") │ " + format_throughput_from_ns(avg_time, num_candidates))
+                print(
+                    "  Run:     "
+                    + format_time(avg_time)
+                    + " (avg of "
+                    + String(repeat)
+                    + ") │ "
+                    + format_throughput_from_ns(avg_time, num_candidates)
+                )
             else:
-                print("  Run:     " + format_time(avg_time) + " │ " + format_throughput_from_ns(avg_time, num_candidates))
+                print(
+                    "  Run:     "
+                    + format_time(avg_time)
+                    + " │ "
+                    + format_throughput_from_ns(avg_time, num_candidates)
+                )
 
             has_baseline = True
             var result_tuple = compute_election_results(baseline)
@@ -1478,15 +1978,21 @@ fn main():
     if run_cpu:
         try:
             # TODO: Rewrite it once `Tuple.__iter__` is supported
-            @parameter
-            for i in range(len(ALLOWED_CPU_TILE_SIZES)):
-                alias tile_size = ALLOWED_CPU_TILE_SIZES[i]
-                if cpu_tile_size != tile_size: continue
+            comptime for i in range(len(ALLOWED_CPU_TILE_SIZES)):
+                comptime tile_size = ALLOWED_CPU_TILE_SIZES[i]
+                if cpu_tile_size != tile_size:
+                    continue
 
-                var result_tuple = profile_and_report(
+                var result_tuple = profile_and_report[
+                    compute_strongest_paths_tiled_cpu[tile_size]
+                ](
                     "Tiled CPU (Mojo)",
-                    compute_strongest_paths_tiled_cpu[tile_size],
-                    preferences, warmup, repeat, num_candidates, has_baseline, baseline
+                    preferences,
+                    warmup,
+                    repeat,
+                    num_candidates,
+                    has_baseline,
+                    baseline,
                 )
                 if not has_winner:
                     winner = result_tuple[1]
@@ -1500,15 +2006,21 @@ fn main():
     if run_cpu:
         try:
             # TODO: Rewrite it once `Tuple.__iter__` is supported
-            @parameter
-            for i in range(len(ALLOWED_CPU_TILE_SIZES)):
-                alias tile_size = ALLOWED_CPU_TILE_SIZES[i]
-                if cpu_tile_size != tile_size: continue
+            comptime for i in range(len(ALLOWED_CPU_TILE_SIZES)):
+                comptime tile_size = ALLOWED_CPU_TILE_SIZES[i]
+                if cpu_tile_size != tile_size:
+                    continue
 
-                var result_tuple = profile_and_report(
+                var result_tuple = profile_and_report[
+                    compute_strongest_paths_tiled_cpu_simd[tile_size]
+                ](
                     "Tiled CPU+SIMD (Mojo)",
-                    compute_strongest_paths_tiled_cpu_simd[tile_size],
-                    preferences, warmup, repeat, num_candidates, has_baseline, baseline
+                    preferences,
+                    warmup,
+                    repeat,
+                    num_candidates,
+                    has_baseline,
+                    baseline,
                 )
                 if not has_winner:
                     winner = result_tuple[1]
@@ -1522,15 +2034,21 @@ fn main():
     if run_gpu:
         try:
             # TODO: Rewrite it once `Tuple.__iter__` is supported
-            @parameter
-            for i in range(len(ALLOWED_GPU_TILE_SIZES)):
-                alias tile_size = ALLOWED_GPU_TILE_SIZES[i]
-                if gpu_tile_size != tile_size: continue
+            comptime for i in range(len(ALLOWED_GPU_TILE_SIZES)):
+                comptime tile_size = ALLOWED_GPU_TILE_SIZES[i]
+                if gpu_tile_size != tile_size:
+                    continue
 
-                var result_tuple = profile_and_report(
+                var result_tuple = profile_and_report[
+                    compute_strongest_paths_gpu[tile_size]
+                ](
                     "Tiled GPU (Mojo)",
-                    compute_strongest_paths_gpu[tile_size],
-                    preferences, warmup, repeat, num_candidates, has_baseline, baseline
+                    preferences,
+                    warmup,
+                    repeat,
+                    num_candidates,
+                    has_baseline,
+                    baseline,
                 )
                 if not has_winner:
                     winner = result_tuple[1]
@@ -1556,6 +2074,20 @@ fn main():
     print()
     print("  Winner: Candidate #" + String(winner))
     if num_candidates >= 5:
-        print("  Top 5:  #" + String(ranking[0]) + ", #" + String(ranking[1]) + ", #" + String(ranking[2]) + ", #" + String(ranking[3]) + ", #" + String(ranking[4]))
+        print(
+            "  Top 5:  #"
+            + String(ranking[0])
+            + ", #"
+            + String(ranking[1])
+            + ", #"
+            + String(ranking[2])
+            + ", #"
+            + String(ranking[3])
+            + ", #"
+            + String(ranking[4])
+        )
 
     print()
+
+
+# endregion Command Line

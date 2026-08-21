@@ -1,22 +1,22 @@
 [project]
-name = "ScalingElections"
-version = "0.2.0"
-description = "GPU-accelerated Schulze voting algorithm in C++/CUDA wrapped into Python 🐍"
-readme = "README.md"
-requires-python = ">=3.9"
 authors = [
-    { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
+  {name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com"},
 ]
-urls = { Homepage = "https://github.com/ashvardanian/ScalingElections" }
-dependencies = ["numpy>=1.26,<2.0"]
+dependencies = ["numpy>=2.0"]
+description = "GPU-accelerated Schulze voting algorithm in C++/CUDA wrapped into Python 🐍"
+name = "ScalingElections"
+readme = "README.md"
+requires-python = ">=3.12"
+urls = {Homepage = "https://ashvardanian.com/posts/scaling-elections", Repository = "https://github.com/ashvardanian/ScalingElections"}
+version = "0.2.0"
 
 [build-system]
-requires = ["setuptools>=65.5.1", "wheel", "pybind11", "numpy>=1.26,<2.0"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=83", "pybind11>=3.0.3"]
 
+# NumBa caps NumPy at `<2.5` until 0.67, so the two floors move together.
 [project.optional-dependencies]
-cpu = ["numba", "pytest"]
-gpu = ["cupy-cuda12x", "pycuda>=2025.1.2"]
+cpu = ["numba>=0.67", "pytest>=9.1"]
 
 [tool.setuptools]
 py-modules = ["scaling_elections"]

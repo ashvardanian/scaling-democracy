@@ -1,9 +1,23 @@
-[project]
-name = "ScalingElections"
-channels = ["conda-forge", "https://conda.modular.com/max"]
-platforms = ["linux-64"]
+[workspace]
+authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
+channels = ["conda-forge", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community"]
 description = "GPU-accelerated Schulze voting algorithm in Mojo 🔥"
+homepage = "https://ashvardanian.com/posts/scaling-elections"
+license = "Apache-2.0"
+license-file = "LICENSE"
+name = "ScalingElections"
+platforms = ["linux-64"]
+readme = "README.md"
+repository = "https://github.com/ashvardanian/ScalingElections"
+version = "0.2.0"
 
+# `mojo` ships separately from `max` now, so pinning `max` alone no longer pins the compiler.
 [dependencies]
+max = ">=26.5,<27"
+mojo = ">=1.0.0,<2"
+numpy = ">=2.0"
 python = "3.12.*"
-max = ">=25.6.1,<26"
+
+[tasks]
+bench = {cmd = "build/scaling_elections --num-candidates 4096 --num-voters 0 --run-gpu --no-serial", depends-on = ["build"]}
+build = "mojo build scaling_elections.mojo -o build/scaling_elections"
