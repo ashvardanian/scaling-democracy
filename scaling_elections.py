@@ -146,9 +146,16 @@ def compute_strongest_paths_tile_numba(
     Space complexity: O(n^2), where n is the tile size.
     """
 
-    for k in range(tile_size):
-        for i in range(tile_size):
-            for j in range(tile_size):
+    # `njit` compiles with `boundscheck=False`, so the tail of a non-divisible matrix has
+    # to be clamped here rather than trapped on access.
+    num_candidates = c.shape[0]
+    k_extent = min(tile_size, num_candidates - max(a_col, b_row))
+    i_extent = min(tile_size, num_candidates - max(c_row, a_row))
+    j_extent = min(tile_size, num_candidates - max(c_col, b_col))
+
+    for k in range(k_extent):
+        for i in range(i_extent):
+            for j in range(j_extent):
                 if (
                     (c_row + i != c_col + j)
                     and (a_row + i != a_col + k)

@@ -61,7 +61,7 @@ from max.gpu.host import DeviceContext
 comptime DEFAULT_CPU_TILE_SIZE = 32
 comptime DEFAULT_GPU_TILE_SIZE = 32
 comptime ALLOWED_CPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)
-comptime ALLOWED_GPU_TILE_SIZES = (4, 8, 12, 16, 24, 32, 48, 64)
+comptime ALLOWED_GPU_TILE_SIZES = (4, 8, 12, 16, 24, 32)
 
 
 @fieldwise_init
@@ -1427,9 +1427,8 @@ def gpu_diagonal_kernel[
     ]()
 
     # Load tile from global memory
-    var flat_index = k * tile_size * n + k * tile_size + bi * n + bj
     c_shared[unsafe_offset=bi * tile_size + bj] = graph[
-        unsafe_offset=flat_index
+        unsafe_offset=k * tile_size * n + k * tile_size + bi * n + bj
     ]
 
     # Synchronize after load
@@ -1452,9 +1451,9 @@ def gpu_diagonal_kernel[
     barrier()
 
     # Write back to global memory
-    graph[unsafe_offset=flat_index] = c_shared[
-        unsafe_offset=bi * tile_size + bj
-    ]
+    graph[
+        unsafe_offset=k * tile_size * n + k * tile_size + bi * n + bj
+    ] = c_shared[unsafe_offset=bi * tile_size + bj]
 
 
 def gpu_partially_independent_kernel[
@@ -1659,7 +1658,19 @@ def compute_strongest_paths_gpu[
     var num_candidates = preferences.num_candidates
     var result = StrongestPathsMatrix(num_candidates)
 
-    # Step 1: Initialize result matrix on CPU (parallelized)
+    # Rounding up to a whole number of tiles keeps the kernels free of tail checks: the
+    # padding is zero, which is the identity of the max-min semiring.
+    var num_tiles = (num_candidates + tile_size - 1) // tile_size
+    var padded = num_tiles * tile_size
+
+    var ctx = DeviceContext()
+    var host_graph = ctx.enqueue_create_host_buffer[DType.uint32](
+        padded * padded
+    )
+    var device_graph = ctx.enqueue_create_buffer[DType.uint32](padded * padded)
+    var host_ptr = host_graph.unsafe_ptr()
+    unsafe_memset_zero(host_ptr, padded * padded)
+
     @parameter
     def init_paths(i: Int):
         for j in range(num_candidates):
@@ -1667,40 +1678,21 @@ def compute_strongest_paths_gpu[
                 var pref_ij = preferences[i, j]
                 var pref_ji = preferences[j, i]
                 if pref_ij > pref_ji:
-                    result[i, j] = pref_ij
-                else:
-                    result[i, j] = 0
+                    host_ptr[unsafe_offset=i * padded + j] = pref_ij
 
     parallelize[init_paths](num_candidates)
 
-    # Step 2: Create GPU device context
-    var ctx = DeviceContext()
-
-    # Step 3: Allocate host and device memory
-    var matrix_size = num_candidates * num_candidates
-    var host_graph = ctx.enqueue_create_host_buffer[DType.uint32](matrix_size)
-    var device_graph = ctx.enqueue_create_buffer[DType.uint32](matrix_size)
-
-    # Step 4: Copy initialized data to host buffer
-    for i in range(matrix_size):
-        host_graph[i] = result.data[unsafe_offset=i]
-
-    # Step 5: Copy from host buffer to device buffer
     host_graph.enqueue_copy_to(device_graph)
     ctx.synchronize()
 
-    # Get raw pointer from device buffer for kernel access
     var graph_ptr = device_graph.unsafe_ptr()
-
-    # Step 6: Execute tiled Floyd-Warshall on GPU
-    var num_tiles = (num_candidates + tile_size - 1) // tile_size
     var block_dim_tuple = (tile_size, tile_size, 1)
 
     for k in range(num_tiles):
         # Phase 1: Diagonal tile (sequential, 1 block)
         ctx.enqueue_function[gpu_diagonal_kernel[tile_size]](
             graph_ptr,
-            Int32(num_candidates),
+            Int32(padded),
             Int32(k),
             grid_dim=(1, 1, 1),
             block_dim=block_dim_tuple,
@@ -1709,7 +1701,7 @@ def compute_strongest_paths_gpu[
         # Phase 2: Partially independent tiles (num_tiles blocks)
         ctx.enqueue_function[gpu_partially_independent_kernel[tile_size]](
             graph_ptr,
-            Int32(num_candidates),
+            Int32(padded),
             Int32(k),
             grid_dim=(num_tiles, 1, 1),
             block_dim=block_dim_tuple,
@@ -1718,7 +1710,7 @@ def compute_strongest_paths_gpu[
         # Phase 3: Independent tiles (num_tiles x num_tiles blocks)
         ctx.enqueue_function[gpu_independent_kernel[tile_size]](
             graph_ptr,
-            Int32(num_candidates),
+            Int32(padded),
             Int32(k),
             grid_dim=(num_tiles, num_tiles, 1),
             block_dim=block_dim_tuple,
@@ -1734,9 +1726,12 @@ def compute_strongest_paths_gpu[
     device_graph.enqueue_copy_to(host_graph)
     ctx.synchronize()
 
-    # Copy from host buffer to result
-    for i in range(matrix_size):
-        result.data[unsafe_offset=i] = UInt32(host_graph[i])
+    # The answer is the leading sub-block of the padded matrix.
+    for i in range(num_candidates):
+        for j in range(num_candidates):
+            result.data[unsafe_offset=i * num_candidates + j] = host_ptr[
+                unsafe_offset=i * padded + j
+            ]
 
     return result^
 
@@ -1807,7 +1802,7 @@ def print_usage():
         " 96, 128 (default: 16)"
     )
     print(
-        "  --gpu-tile-size N     GPU tile size: 4, 8, 12, 16, 24, 32, 48, 64"
+        "  --gpu-tile-size N     GPU tile size: 4, 8, 12, 16, 24, 32"
         " (default: 32)"
     )
     print("  --warmup N            Number of warmup iterations (default: 1)")
@@ -1884,8 +1879,8 @@ def main():
     if run_gpu and gpu_tile_size not in ALLOWED_GPU_TILE_SIZES:
         print(
             (
-                "Warning: --gpu-tile-size must be 4, 8, 12, 16, 24, 32, 48, or"
-                " 64. Using default:"
+                "Warning: --gpu-tile-size must be 4, 8, 12, 16, 24, or 32."
+                " Using default:"
             ),
             DEFAULT_GPU_TILE_SIZE,
         )

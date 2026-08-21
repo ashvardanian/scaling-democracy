@@ -11,6 +11,9 @@
 #include <cstdlib> // `std::rand`
 
 #include <algorithm> // `std::min`, `std::max`
+#include <iterator>  // `std::rbegin`, `std::rend`
+#include <numeric>   // `std::accumulate`
+#include <optional>  // `std::optional`, `std::nullopt`
 #include <stdexcept> // `std::runtime_error`
 #include <thread>    // `std::thread::hardware_concurrency()`
 #include <vector>    // `std::vector`
@@ -480,51 +483,32 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
 }
 #endif // !defined(SCALING_ELECTIONS_WITH_HIP)
 
+#if !defined(SCALING_ELECTIONS_WITH_HIP)
+
+/// Tensor map for the Hopper bulk-tensor path, absent when the device or the layout rules it out.
+using tma_descriptor_t = std::optional<CUtensorMap>;
+
 /**
- * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA or @b HIP.
+ * @brief Builds the tensor map describing the padded strongest-paths matrix.
  *
  * @tparam tile_size The size of the tile to be processed.
- * @param preferences The preferences matrix.
- * @param num_candidates The number of candidates.
- * @param row_stride The stride between rows in the preferences matrix.
- * @param graph The output matrix of strongest paths.
+ * @param graph The padded matrix of strongest paths.
+ * @param graph_stride The row stride of the padded matrix.
+ * @param device_props Properties of the device the kernels will run on.
  */
-template <std::uint32_t tile_size> //
-void compute_strongest_paths_cuda( //
-    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph,
-    bool allow_tma) {
+template <std::uint32_t tile_size>
+tma_descriptor_t describe_tma_(votes_count_t* graph, candidate_idx_t graph_stride, cudaDeviceProp const& device_props) {
+    if (device_props.major < 9)
+        return std::nullopt;
 
-#if defined(SCALING_ELECTIONS_WITH_OPENMP)
-#pragma omp parallel for collapse(2)
-#endif
-    for (candidate_idx_t i = 0; i < num_candidates; i++)
-        for (candidate_idx_t j = 0; j < num_candidates; j++)
-            if (i != j)
-                graph[i * num_candidates + j] = preferences[i * row_stride + j] > preferences[j * row_stride + i] //
-                                                    ? preferences[i * row_stride + j]
-                                                    : 0;
+    CUtensorMap descriptor_map{};
 
-    // Check if we can use newer CUDA features.
-    cudaError_t error;
-    int current_device;
-    cudaDeviceProp device_props;
-    error = cudaGetDevice(&current_device);
-    if (error != cudaSuccess)
-        throw std::runtime_error("Failed to get current device");
-    error = cudaGetDeviceProperties(&device_props, current_device);
-    if (error != cudaSuccess)
-        throw std::runtime_error("Failed to get device properties");
-
-#if !defined(SCALING_ELECTIONS_WITH_HIP)
-    bool supports_tma = device_props.major >= 9;
-
-    CUtensorMap strongest_paths_tensor_map{};
     // rank is the number of dimensions of the array.
     constexpr std::uint32_t rank = 2;
-    uint64_t size[rank] = {num_candidates, num_candidates};
+    uint64_t size[rank] = {graph_stride, graph_stride};
     // The stride is the number of bytes to traverse from the first element of one row to the next.
     // It must be a multiple of 16.
-    uint64_t stride[rank - 1] = {num_candidates * sizeof(votes_count_t)};
+    uint64_t stride[rank - 1] = {graph_stride * sizeof(votes_count_t)};
     // The box_size is the size of the shared memory buffer that is used as the
     // destination of a TMA transfer.
     std::uint32_t box_size[rank] = {tile_size, tile_size};
@@ -536,7 +520,7 @@ void compute_strongest_paths_cuda( //
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     PFN_cuTensorMapEncodeTiled_v12000 cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
     CUresult res = cuTensorMapEncodeTiled( //
-        &strongest_paths_tensor_map,       // CUtensorMap *tensorMap,
+        &descriptor_map,                   // CUtensorMap *tensorMap,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
         rank,        // cuuint32_t tensorRank,
         graph,       // void *globalAddress,
@@ -554,24 +538,93 @@ void compute_strongest_paths_cuda( //
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
         // Any element that is outside of bounds will be set to zero by the TMA transfer.
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (res != CUDA_SUCCESS)
+        return std::nullopt;
+    return descriptor_map;
+}
+
+/**
+ * @brief Launches the independent phase, preferring the bulk-tensor kernel where it is available.
+ *
+ * @tparam tile_size The size of the tile to be processed.
+ * @param grid The grid shape covering every tile pair.
+ * @param block The block shape, one thread per tile cell.
+ * @param graph_stride The row stride of the padded matrix.
+ * @param k The index of the current pivot tile.
+ * @param graph The padded matrix of strongest paths.
+ * @param tma The tensor-map descriptor produced by @c describe_tma_ .
+ * @param allow_tma Whether the caller permits the bulk-tensor path.
+ */
+template <std::uint32_t tile_size>
+void launch_independent_(dim3 grid, dim3 block, candidate_idx_t graph_stride, candidate_idx_t k, votes_count_t* graph,
+                         tma_descriptor_t const& tma, bool allow_tma) {
+    if (allow_tma && tma.has_value())
+        cuda_independent_hopper_<tile_size><<<grid, block>>>(graph_stride, k, *tma);
+    else
+        cuda_independent_<tile_size><<<grid, block>>>(graph_stride, k, graph);
+}
+
 #else
-    // HIP/AMD GPUs don't support Tensor Memory Access (TMA)
-    bool supports_tma = false;
+
+/// HIP has no bulk-tensor engine, so the descriptor type can never hold one.
+using tma_descriptor_t = std::nullopt_t;
+
+template <std::uint32_t tile_size>
+tma_descriptor_t describe_tma_(votes_count_t*, candidate_idx_t, cudaDeviceProp const&) {
+    return std::nullopt;
+}
+
+template <std::uint32_t tile_size>
+void launch_independent_(dim3 grid, dim3 block, candidate_idx_t graph_stride, candidate_idx_t k, votes_count_t* graph,
+                         tma_descriptor_t const&, bool) {
+    cuda_independent_<tile_size><<<grid, block>>>(graph_stride, k, graph);
+}
+
 #endif
 
-    candidate_idx_t tiles_count = (num_candidates + tile_size - 1) / tile_size;
+/**
+ * @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA or @b HIP.
+ *
+ * @tparam tile_size The size of the tile to be processed.
+ * @param preferences The preferences matrix.
+ * @param num_candidates The number of candidates.
+ * @param row_stride The stride between rows in the preferences matrix.
+ * @param graph The output matrix of strongest paths.
+ */
+template <std::uint32_t tile_size> //
+void compute_strongest_paths_cuda( //
+    votes_count_t* preferences, candidate_idx_t num_candidates, candidate_idx_t row_stride, votes_count_t* graph,
+    candidate_idx_t graph_stride, bool allow_tma) {
+
+#if defined(SCALING_ELECTIONS_WITH_OPENMP)
+#pragma omp parallel for collapse(2)
+#endif
+    for (candidate_idx_t i = 0; i < num_candidates; i++)
+        for (candidate_idx_t j = 0; j < num_candidates; j++)
+            graph[i * graph_stride + j] = i != j && preferences[i * row_stride + j] > preferences[j * row_stride + i]
+                                              ? preferences[i * row_stride + j]
+                                              : 0;
+
+    // Check if we can use newer CUDA features.
+    cudaError_t error;
+    int current_device;
+    cudaDeviceProp device_props;
+    error = cudaGetDevice(&current_device);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to get current device");
+    error = cudaGetDeviceProperties(&device_props, current_device);
+    if (error != cudaSuccess)
+        throw std::runtime_error("Failed to get device properties");
+
+    tma_descriptor_t const tma = describe_tma_<tile_size>(graph, graph_stride, device_props);
+
+    candidate_idx_t tiles_count = graph_stride / tile_size;
     dim3 tile_shape(tile_size, tile_size, 1);
     dim3 independent_grid(tiles_count, tiles_count, 1);
     for (candidate_idx_t k = 0; k < tiles_count; k++) {
-        cuda_diagonal_<tile_size><<<1, tile_shape>>>(num_candidates, k, graph);
-        cuda_partially_independent_<tile_size><<<tiles_count, tile_shape>>>(num_candidates, k, graph);
-#if !defined(SCALING_ELECTIONS_WITH_HIP)
-        if (supports_tma && allow_tma)
-            cuda_independent_hopper_<tile_size>
-                <<<independent_grid, tile_shape>>>(num_candidates, k, strongest_paths_tensor_map);
-        else
-#endif
-            cuda_independent_<tile_size><<<independent_grid, tile_shape>>>(num_candidates, k, graph);
+        cuda_diagonal_<tile_size><<<1, tile_shape>>>(graph_stride, k, graph);
+        cuda_partially_independent_<tile_size><<<tiles_count, tile_shape>>>(graph_stride, k, graph);
+        launch_independent_<tile_size>(independent_grid, tile_shape, graph_stride, k, graph, tma, allow_tma);
 
         error = cudaGetLastError();
         if (error != cudaSuccess)
@@ -699,10 +752,9 @@ void memcpy2d(votes_count_t const* source, candidate_idx_t stride, votes_count_t
 
     for (candidate_idx_t i = 0; i < tile_size; i++)
         for (candidate_idx_t j = 0; j < tile_size; j++)
-            if constexpr (check_tail) {
-                if (i < remaining_rows && j < remaining_cols)
-                    target[i][j] = source[i * stride + j];
-            } else
+            if constexpr (check_tail)
+                target[i][j] = i < remaining_rows && j < remaining_cols ? source[i * stride + j] : 0;
+            else
                 target[i][j] = source[i * stride + j];
 }
 
@@ -883,24 +935,37 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
 #if defined(SCALING_ELECTIONS_WITH_CUDA)
 
     if (allow_gpu) {
+        if (tile_size == 0)
+            tile_size = 32;
+        // Rounding the matrix up to a whole number of tiles keeps the kernels free of tail
+        // checks: the padding is zero, which is the identity of the max-min semiring.
+        candidate_idx_t const graph_stride = (num_candidates + tile_size - 1) / tile_size * tile_size;
+        std::size_t const graph_bytes = static_cast<std::size_t>(graph_stride) * graph_stride * sizeof(votes_count_t);
+
         votes_count_t* strongest_paths_ptr = nullptr;
         cudaError_t error;
-        error = cudaMallocManaged(&strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t));
+        error = cudaMallocManaged(&strongest_paths_ptr, graph_bytes);
         if (error != cudaSuccess)
             throw std::runtime_error("Failed to allocate memory on device");
 
-        using cuda_kernel_t = void (*)(votes_count_t*, candidate_idx_t, candidate_idx_t, votes_count_t*, bool);
+        using cuda_kernel_t =
+            void (*)(votes_count_t*, candidate_idx_t, candidate_idx_t, votes_count_t*, candidate_idx_t, bool);
         cuda_kernel_t cuda_kernel = nullptr;
         switch (tile_size) {
         case 4: cuda_kernel = &compute_strongest_paths_cuda<4>; break;
         case 8: cuda_kernel = &compute_strongest_paths_cuda<8>; break;
         case 16: cuda_kernel = &compute_strongest_paths_cuda<16>; break;
         case 32: cuda_kernel = &compute_strongest_paths_cuda<32>; break;
-        default: throw std::runtime_error("Unsupported tile size");
+        default: cudaFree(strongest_paths_ptr); throw std::runtime_error("Unsupported tile size");
         }
 
-        cudaMemset(strongest_paths_ptr, 0, num_candidates * num_candidates * sizeof(votes_count_t));
-        cuda_kernel(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, allow_tma);
+        cudaMemset(strongest_paths_ptr, 0, graph_bytes);
+        error = cudaDeviceSynchronize();
+        if (error != cudaSuccess) {
+            cudaFree(strongest_paths_ptr);
+            throw std::runtime_error("Failed to clear device memory");
+        }
+        cuda_kernel(preferences_ptr, num_candidates, row_stride, strongest_paths_ptr, graph_stride, allow_tma);
 
         // Synchronize to ensure all CUDA operations are complete
         error = cudaDeviceSynchronize();
@@ -910,8 +975,9 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
         }
 
         // Copy data from the GPU to the NumPy array
-        error = cudaMemcpy(result_ptr, strongest_paths_ptr, num_candidates * num_candidates * sizeof(votes_count_t),
-                           cudaMemcpyDeviceToHost);
+        error = cudaMemcpy2D(result_ptr, num_candidates * sizeof(votes_count_t), strongest_paths_ptr,
+                             graph_stride * sizeof(votes_count_t), num_candidates * sizeof(votes_count_t),
+                             num_candidates, cudaMemcpyDeviceToHost);
         if (error != cudaSuccess) {
             cudaFree(strongest_paths_ptr);
             throw std::runtime_error("Failed to copy data from device to host");
@@ -954,7 +1020,8 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     kernel_t aligned_kernel = nullptr;
     kernel_t unaligned_kernel = nullptr;
     if (tile_size == 0) {
-        for (auto const& kernel : tiled_kernels) {
+        for (auto it = std::rbegin(tiled_kernels); it != std::rend(tiled_kernels); ++it) {
+            auto const& kernel = *it;
             if (num_candidates >= kernel.tile_size) {
                 tile_size = kernel.tile_size;
                 aligned_kernel = kernel.aligned_kernel;
