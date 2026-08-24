@@ -1,7 +1,7 @@
 [workspace]
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
 channels = ["conda-forge", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community"]
-description = "GPU-accelerated Schulze voting algorithm in Mojo 🔥"
+description = "ScalingElections: Condorcet Voting at GPU Speed — Schulze as semiring matrix multiplication, Kemeny-Young as exact NP-hard search"
 homepage = "https://ashvardanian.com/posts/scaling-elections"
 license = "Apache-2.0"
 license-file = "LICENSE"
@@ -25,4 +25,4 @@ build = {cmd = "mojo build scalingelections.mojo --emit shared-lib -o build/scal
 build-cli = {cmd = "mojo build cli.mojo -o build/scalingelections", depends-on = ["prepare"]}
 format = "mojo format -l 120 *.mojo"
 prepare = "mkdir -p build"
-test = {cmd = "pytest test.py", depends-on = ["build", "build-cli"]}
+test = {cmd = "pytest test.py", depends-on = ["build"]}

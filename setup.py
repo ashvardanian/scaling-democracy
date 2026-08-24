@@ -58,6 +58,18 @@ def detect_cuda_archs():
 
 HEADERS = ["types.cuh", "ballots.cuh", "schulze.cuh", "kemeny.cuh"]
 
+
+def cccl_include() -> list:
+    """A host-only build needs libcu++'s `mdspan` where the standard library has none of its own."""
+    roots = [
+        os.path.join(CUDA_HOME, "include"),
+        os.path.join(CUDA_HOME, "include", "cccl"),
+    ]
+    return [root for root in roots if os.path.exists(os.path.join(root, "cuda", "std", "mdspan"))][:1]
+
+
+CCCL_INCLUDE = cccl_include()
+
 cuda_available = has_cuda()
 rocm_available = has_rocm()
 is_macos = platform.system() == "Darwin"
@@ -97,9 +109,7 @@ class BuildExt(build_ext):
         objects = []
         for source in ext.sources:
             if not source.endswith(".cu"):
-                obj = self.compiler.compile(
-                    [source], output_dir=self.build_temp, extra_postargs=["-fPIC"]
-                )
+                obj = self.compiler.compile([source], output_dir=self.build_temp, extra_postargs=["-fPIC"])
                 objects.extend(obj)
 
         # Link all object files
@@ -123,9 +133,7 @@ class BuildExt(build_ext):
         objects = []
         for source in ext.sources:
             if not source.endswith(".cu"):
-                obj = self.compiler.compile(
-                    [source], output_dir=self.build_temp, extra_postargs=["-fPIC"]
-                )
+                obj = self.compiler.compile([source], output_dir=self.build_temp, extra_postargs=["-fPIC"])
                 objects.extend(obj)
 
         # Link all object files
@@ -146,7 +154,7 @@ class BuildExt(build_ext):
         if is_macos:
             # macOS with clang doesn't support some GCC flags
             opt_flags = [
-                "-std=c++17",  # C++17 standard, required for pybind11
+                "-std=c++20",  # C++20 standard, required for `cuda::std::mdspan`
                 "-fPIC",  # Position Independent Code
                 "-O3",  # Maximum optimization
                 "-ffast-math",  # Aggressive floating-point optimizations
@@ -156,7 +164,7 @@ class BuildExt(build_ext):
         else:
             # Linux with GCC
             opt_flags = [
-                "-std=c++17",  # C++17 standard, required for pybind11
+                "-std=c++20",  # C++20 standard, required for `cuda::std::mdspan`
                 "-fPIC",  # Position Independent Code
                 "-fopenmp",  # OpenMP support
                 "-O3",  # Maximum optimization
@@ -207,15 +215,11 @@ class BuildExt(build_ext):
 
         arch_codes = detect_cuda_archs()
         # SASS for every target, PTX only for the newest so older toolkits can still JIT forward.
-        gencodes = " ".join(
-            f"-gencode arch=compute_{arch},code=sm_{arch}" for arch in arch_codes
-        )
-        gencodes += (
-            f" -gencode arch=compute_{arch_codes[-1]},code=compute_{arch_codes[-1]}"
-        )
+        gencodes = " ".join(f"-gencode arch=compute_{arch},code=sm_{arch}" for arch in arch_codes)
+        gencodes += f" -gencode arch=compute_{arch_codes[-1]},code=compute_{arch_codes[-1]}"
 
         cmd = (
-            f"nvcc -ccbin g++ -c {source} -o {output_file} -std=c++17 "
+            f"nvcc -ccbin g++ -c {source} -o {output_file} -std=c++20 "
             f"{gencodes} "
             f"-Xcompiler -fPIC,-fopenmp,-march=native {include_dirs} -O3 -g"
         )
@@ -247,9 +251,7 @@ class BuildExt(build_ext):
         try:
             import subprocess
 
-            result = subprocess.run(
-                ["rocminfo"], capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 # Parse rocminfo output to find gfx architecture
                 for line in result.stdout.split("\n"):
@@ -273,7 +275,7 @@ class BuildExt(build_ext):
         # Build the hipcc command
         # HIP can often compile CUDA code directly with --cuda-gpu-arch for compatibility
         cmd = (
-            f"hipcc -c {source} -o {output_file} -std=c++17 "
+            f"hipcc -c {source} -o {output_file} -std=c++20 "
             f"--offload-arch={arch_code} "
             f"-fPIC -fopenmp {include_dirs} -O3 -g "
             f"-D__HIP_PLATFORM_AMD__"
@@ -294,9 +296,7 @@ with open(os.path.join(this_directory, "README.md"), encoding="utf-8") as f:
 # Use sysconfig which is more reliable than sys.prefix for finding libraries
 python_lib_dir = sysconfig.get_config_var("LIBDIR")
 if not python_lib_dir or not os.path.exists(
-    os.path.join(
-        python_lib_dir, f"libpython{sys.version_info.major}.{sys.version_info.minor}.so"
-    )
+    os.path.join(python_lib_dir, f"libpython{sys.version_info.major}.{sys.version_info.minor}.so")
 ):
     # Fallback: resolve the real path of the Python executable and use its lib directory
     python_executable = os.path.realpath(sys.executable)
@@ -383,6 +383,7 @@ else:
                 include_dirs=[
                     pybind11.get_include(),
                     python_include,
+                    *CCCL_INCLUDE,
                 ],
                 library_dirs=[
                     python_lib_dir,
@@ -406,6 +407,7 @@ else:
                 include_dirs=[
                     pybind11.get_include(),
                     python_include,
+                    *CCCL_INCLUDE,
                 ],
                 library_dirs=[
                     "/usr/lib/x86_64-linux-gnu",

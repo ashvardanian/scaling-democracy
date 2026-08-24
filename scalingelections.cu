@@ -5,13 +5,11 @@
  *  @date July 12, 2024
  *  @see https://ashvardanian.com/posts/scaling-elections
  */
-#if !defined(SCALING_ELECTIONS_TEST)
 #include <pybind11/numpy.h> // `array_t`
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
-#endif
 
 #include "types.cuh"
 #include "ballots.cuh"
@@ -27,11 +25,18 @@ inline backend_t backend_from_name(std::string_view name) {
 }
 
 /** Resolves the Kemeny backend name the Python layer passes, throwing on anything unrecognized. */
+inline tally_backend_t tally_backend_from_name(std::string_view name) {
+    if (name == "auto") return tally_backend_t::automatic_k;
+    if (name == "cpu_openmp") return tally_backend_t::cpu_openmp_k;
+    if (name == "gpu_privatized") return tally_backend_t::gpu_privatized_k;
+    throw std::invalid_argument("Tally backend must be one of: auto, cpu_openmp, gpu_privatized");
+}
+
 inline kemeny_backend_t kemeny_backend_from_name(std::string_view name) {
     if (name == "auto") return kemeny_backend_t::automatic_k;
-    if (name == "cpu_serial") return kemeny_backend_t::cpu_serial_k;
+    if (name == "cpu_openmp") return kemeny_backend_t::cpu_openmp_k;
     if (name == "gpu_layered") return kemeny_backend_t::gpu_layered_k;
-    throw std::invalid_argument("Kemeny backend must be one of: auto, cpu_serial, gpu_layered");
+    throw std::invalid_argument("Kemeny backend must be one of: auto, cpu_openmp, gpu_layered");
 }
 
 /** Stores the interrupt signal status. */
@@ -63,7 +68,6 @@ struct openmp_team_t {
 #endif
 
 #pragma region Python bindings
-#if !defined(SCALING_ELECTIONS_TEST)
 
 /**
  *  @brief Computes the strongest paths for the block-parallel Schulze voting algorithm.
@@ -74,9 +78,9 @@ struct openmp_team_t {
  *
  *  @note A backend the build or the device cannot serve raises rather than downgrading.
  */
-static py::array_t<votes_count_t> compute_strongest_paths(      //
+static py::array_t<votes_count_t> strongest_paths_over_(        //
     py::array_t<votes_count_t, py::array::c_style> preferences, //
-    std::string_view backend_name) {
+    std::string_view backend_name, seed_graph_t seed) {
 
     backend_t const backend = backend_from_name(backend_name);
 
@@ -86,6 +90,7 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
     auto preferences_ptr = reinterpret_cast<votes_count_t*>(buffer.ptr);
     auto num_candidates = static_cast<candidate_index_t>(buffer.shape[0]);
     auto row_stride = static_cast<candidate_index_t>(buffer.strides[0] / sizeof(votes_count_t));
+    const_matrix_t const preferences_view = square_view(preferences_ptr, num_candidates, row_stride);
 
     // Allocate NumPy array for the result
     auto result = py::array_t<votes_count_t>({num_candidates, num_candidates});
@@ -101,22 +106,20 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
         // Rounding the matrix up to a whole number of tiles keeps the kernels free of tail
         // checks: the padding is zero, which is the identity of the max-min semiring.
         candidate_index_t const graph_stride = (num_candidates + tile_size_k - 1) / tile_size_k * tile_size_k;
-        std::size_t const graph_bytes = static_cast<std::size_t>(graph_stride) * graph_stride * sizeof(votes_count_t);
-
-        managed_graph_t const graph(graph_bytes);
-        cudaError_t error = cudaMemset(graph.pointer, 0, graph_bytes);
+        managed_vector<votes_count_t> graph(static_cast<std::size_t>(graph_stride) * graph_stride);
+        cudaError_t error = cudaMemset(graph.data(), 0, graph.size() * sizeof(votes_count_t));
         if (error != cudaSuccess) throw std::runtime_error("Failed to clear device memory");
         error = cudaDeviceSynchronize();
         if (error != cudaSuccess) throw std::runtime_error("Failed to clear device memory");
 
-        compute_strongest_paths_cuda<tile_size_k>(preferences_ptr, num_candidates, row_stride, graph.pointer,
-                                                  graph_stride, backend);
+        compute_strongest_paths_cuda<tile_size_k>(preferences_view,
+                                                  square_view(graph.data(), graph_stride, graph_stride), backend, seed);
 
         error = cudaDeviceSynchronize();
         if (error != cudaSuccess) throw std::runtime_error("CUDA operations did not complete successfully");
 
         // Copy the leading sub-block back, dropping the padding.
-        error = cudaMemcpy2D(result_ptr, num_candidates * sizeof(votes_count_t), graph.pointer,
+        error = cudaMemcpy2D(result_ptr, num_candidates * sizeof(votes_count_t), graph.data(),
                              graph_stride * sizeof(votes_count_t), num_candidates * sizeof(votes_count_t),
                              num_candidates, cudaMemcpyDeviceToHost);
         if (error != cudaSuccess) throw std::runtime_error("Failed to copy data from device to host");
@@ -138,13 +141,55 @@ static py::array_t<votes_count_t> compute_strongest_paths(      //
 
     // A tile wider than the electorate is not an error: `checked_k` zero-fills the tail, and
     // zero is the identity of the max-min semiring, so the padding can never win a comparison.
+    matrix_t const result_view = square_view(result_ptr, num_candidates, num_candidates);
     if (num_candidates % tile_size_k == 0)
         compute_strongest_paths_openmp<tile_size_k, tile_march_t::fast_k>( //
-            preferences_ptr, num_candidates, row_stride, result_ptr, &global_signal_status);
+            preferences_view, result_view, &global_signal_status, seed);
     else
         compute_strongest_paths_openmp<tile_size_k, tile_march_t::checked_k>( //
-            preferences_ptr, num_candidates, row_stride, result_ptr, &global_signal_status);
+            preferences_view, result_view, &global_signal_status, seed);
     return result;
+}
+
+/**
+ *  @brief Widest paths over winning votes, which is the variant Schulze runs on here.
+ *
+ *  @param[in] preferences The preferences matrix.
+ *  @param[in] backend_name One of `cpu_openmp`, `gpu_serial`, or `gpu_hopper`.
+ *  @return A NumPy array containing the strongest paths matrix.
+ */
+static py::array_t<votes_count_t> compute_strongest_paths(      //
+    py::array_t<votes_count_t, py::array::c_style> preferences, //
+    std::string_view backend_name) {
+    return strongest_paths_over_(preferences, backend_name, seed_graph_t::winning_votes_k);
+}
+
+/**
+ *  @brief The Split Cycle winning set, which is every candidate nobody defeats.
+ *
+ *  @param[in] preferences The preferences matrix.
+ *  @param[in] backend_name One of `cpu_openmp`, `gpu_serial`, or `gpu_hopper`.
+ *  @return The undefeated candidates, in increasing order.
+ *
+ *  The same max-min kernel serves both methods; only the graph it closes over differs, which is
+ *  what being a C2 rule buys.
+ */
+static std::vector<candidate_index_t> compute_split_cycle_winners( //
+    py::array_t<votes_count_t, py::array::c_style> preferences,    //
+    std::string_view backend_name) {
+
+    py::array_t<votes_count_t> const margin_paths = strongest_paths_over_(preferences, backend_name,
+                                                                          seed_graph_t::positive_margins_k);
+
+    py::buffer_info const preferences_buffer = preferences.request();
+    py::buffer_info const paths_buffer = margin_paths.request();
+    auto const num_candidates = static_cast<candidate_index_t>(preferences_buffer.shape[0]);
+    auto const row_stride = static_cast<candidate_index_t>(preferences_buffer.strides[0] / sizeof(votes_count_t));
+
+    py::gil_scoped_release release;
+    return split_cycle_winners(
+        square_view(reinterpret_cast<votes_count_t const*>(preferences_buffer.ptr), num_candidates, row_stride),
+        square_view(reinterpret_cast<votes_count_t const*>(paths_buffer.ptr), num_candidates, num_candidates));
 }
 
 /**
@@ -173,33 +218,10 @@ static void log_gpus() { throw std::runtime_error("No CUDA devices available"); 
 #endif
 
 /**
- *  @brief Sums a contiguous float array, showing how `thrust::` reaches the same device.
- *
- *  @param[in] data A contiguous one-dimensional float array.
- *  @return The sum of its elements.
- *
- *  @note `rocThrust` is not guaranteed to be present, so HIP and CPU-only builds sum on the host.
- */
-#if defined(SCALING_ELECTIONS_WITH_CUDA) && !defined(SCALING_ELECTIONS_WITH_HIP)
-static float reduce(py::array_t<float> const& data) {
-    py::buffer_info buffer = data.request();
-    if (buffer.ndim != 1 || buffer.strides[0] != sizeof(float))
-        throw std::runtime_error("Input should be a contiguous 1D float array");
-    float* pointer = static_cast<float*>(buffer.ptr);
-    thrust::device_vector<float> on_device(pointer, pointer + buffer.size);
-    return thrust::reduce(thrust::device, on_device.begin(), on_device.end(), 0.0f);
-}
-#else
-static float reduce(py::array_t<float> const& data) {
-    return std::accumulate(data.data(), data.data() + data.size(), 0.0f);
-}
-#endif
-
-/**
  *  @brief Computes the exact Kemeny-Young consensus ranking and its disagreement score.
  *
  *  @param[in] preferences The preferences matrix.
- *  @param[in] backend_name One of `auto`, `cpu_serial`, or `gpu_layered`.
+ *  @param[in] backend_name One of `auto`, `cpu_openmp`, or `gpu_layered`.
  *  @return A tuple of the ranking, best first, and the disagreement it achieves.
  */
 static py::tuple compute_kemeny_ranking(py::array_t<votes_count_t, py::array::c_style> const& preferences,
@@ -210,12 +232,46 @@ static py::tuple compute_kemeny_ranking(py::array_t<votes_count_t, py::array::c_
     if (buffer.ndim != 2 || buffer.shape[0] != buffer.shape[1])
         throw std::runtime_error("Preferences must be a square matrix");
     candidate_index_t const num_candidates = static_cast<candidate_index_t>(buffer.shape[0]);
-    if (num_candidates < 1 || num_candidates > 34)
-        throw std::runtime_error("Kemeny is exact to 34 candidates, beyond which the table exceeds 64 GiB");
 
     kemeny_solution_t const solution = kemeny_solve(static_cast<votes_count_t const*>(buffer.ptr), num_candidates,
                                                     backend);
     return py::make_tuple(solution.ranking, solution.score);
+}
+
+/**
+ *  @brief Folds one chunk of complete rankings into a pairwise preference matrix.
+ *
+ *  @param[in] rankings A two-dimensional array of complete rankings, best candidate first.
+ *  @param[in] backend_name One of `cpu_openmp` or `gpu_privatized`.
+ *  @return The square matrix counting, for each ordered pair, the ballots preferring the first.
+ *
+ *  Every ballot must rank every candidate, so a caller with partial ballots completes them first.
+ */
+static py::array_t<votes_count_t> tally_ballots_py(py::array_t<candidate_index_t, py::array::c_style> const& rankings,
+                                                   std::string const& backend_name) {
+
+    tally_backend_t const backend = tally_backend_from_name(backend_name);
+
+    py::buffer_info buffer = rankings.request();
+    if (buffer.ndim != 2) throw std::runtime_error("Rankings must be a two-dimensional array");
+    std::size_t const num_ballots = static_cast<std::size_t>(buffer.shape[0]);
+    candidate_index_t const num_candidates = static_cast<candidate_index_t>(buffer.shape[1]);
+    if (num_candidates < 1) throw std::runtime_error("Every ballot must rank at least one candidate");
+
+    py::array_t<votes_count_t> preferences({num_candidates, num_candidates});
+    votes_count_t* preferences_ptr = static_cast<votes_count_t*>(preferences.request().ptr);
+    candidate_index_t const* rankings_ptr = static_cast<candidate_index_t const*>(buffer.ptr);
+    std::size_t const cells = static_cast<std::size_t>(num_candidates) * num_candidates;
+    std::fill(preferences_ptr, preferences_ptr + cells, votes_count_t {0});
+
+    ballots_t const rankings_view = strided_view<candidate_index_t const, std::size_t>(rankings_ptr, num_ballots,
+                                                                                       num_candidates, num_candidates);
+    matrix_t const preferences_view = square_view(preferences_ptr, num_candidates, num_candidates);
+    {
+        py::gil_scoped_release release;
+        tally_ballots(rankings_view, preferences_view, backend);
+    }
+    return preferences;
 }
 
 PYBIND11_MODULE(scalingelections_cuda, m) {
@@ -223,32 +279,18 @@ PYBIND11_MODULE(scalingelections_cuda, m) {
     std::signal(SIGINT, signal_handler);
 
     m.def("log_gpus", &log_gpus);
-    m.def("reduce", &reduce, py::arg("data"));
+    m.def("tally_ballots", &tally_ballots_py, //
+          py::arg("rankings"), py::kw_only(), //
+          py::arg("backend") = "auto");
     m.def("compute_kemeny_ranking", &compute_kemeny_ranking, //
           py::arg("preferences"), py::kw_only(),             //
           py::arg("backend") = "auto");
     m.def("compute_strongest_paths", &compute_strongest_paths, //
           py::arg("preferences"), py::kw_only(),               //
           py::arg("backend") = "cpu_openmp");
+    m.def("compute_split_cycle_winners", &compute_split_cycle_winners, //
+          py::arg("preferences"), py::kw_only(),                       //
+          py::arg("backend") = "cpu_openmp");
 }
 
-#endif // !defined(SCALING_ELECTIONS_TEST)
 #pragma endregion Python bindings
-
-#if defined(SCALING_ELECTIONS_TEST)
-
-int main() {
-
-    std::size_t num_candidates = 256;
-    std::vector<votes_count_t> preferences(num_candidates * num_candidates);
-    std::generate(preferences.begin(), preferences.end(),
-                  [=]() { return static_cast<votes_count_t>(std::rand() % num_candidates); });
-
-    std::vector<votes_count_t> graph(num_candidates * num_candidates);
-    compute_strongest_paths_openmp<64, tile_march_t::fast_k>( //
-        preferences.data(), num_candidates, num_candidates, graph.data());
-
-    return 0;
-}
-
-#endif // defined(SCALING_ELECTIONS_TEST)

@@ -7,13 +7,21 @@ so this is the Held-Karp subset dynamic program instead: `O(n * 2^n)` time again
 memory, exact rather than approximate, and practical to roughly two dozen candidates.
 """
 
+from max.algorithm import parallelize
+
 from ballots import PreferenceMatrix
 
 # region Kemeny
 
 
-comptime KemenyScore = UInt32
-"""Pairwise disagreements summed, bounded by `voters * n * (n - 1) / 2`, which 32 bits hold."""
+comptime KEMENY_MAX_CANDIDATES = 33
+"""The widest field an exact table can address, bounded by memory rather than by time."""
+
+comptime KemenyScore = UInt64
+"""Pairwise disagreements summed, bounded by `voters * n * (n - 1) / 2`, which 64 bits hold."""
+
+comptime KEMENY_LAYER_CHUNK = 4096
+"""Colex ranks one worker takes at a time, so a layer costs one closure call per chunk."""
 
 
 def accumulate_subset_sums(
@@ -28,7 +36,7 @@ def accumulate_subset_sums(
     var offset = 0
     var bit = 1
     while bit < states:
-        var votes = preferences[candidate, first_opponent + offset]
+        var votes = KemenyScore(preferences[candidate, first_opponent + offset])
         for subset in range(bit, states):
             if subset & bit:
                 table[base + subset] = table[base + (subset ^ bit)] + votes
@@ -85,9 +93,51 @@ struct KemenySums(Movable):
         )
 
 
-def kemeny_ranking(
-    preferences: PreferenceMatrix,
-) raises -> Tuple[List[Int], Int]:
+@fieldwise_init
+struct KemenySolution(Movable):
+    """An exact Kemeny-Young consensus ranking and the disagreement it achieves."""
+
+    var ranking: List[Int]
+    """The candidates in consensus order, best placed first."""
+    var score: Int
+    """Ballot pairs the ranking disagrees with, which no other ordering undercuts."""
+
+
+def binomial_table(num_candidates: Int) -> List[UInt32]:
+    """Pascal's triangle, entry `upper * (num_candidates + 1) + lower` counting `C(upper, lower)`."""
+    var stride = num_candidates + 1
+    var table = List[UInt32]()
+    table.resize(stride * stride, 0)
+    # `C(33, 16)` is the widest entry a 32-bit slot has to hold.
+    for upper in range(stride):
+        table[upper * stride] = 1
+        for lower in range(1, upper + 1):
+            table[upper * stride + lower] = (
+                table[(upper - 1) * stride + lower] + table[(upper - 1) * stride + lower - 1]
+            )
+    return table^
+
+
+@always_inline
+def subset_at_colex_rank(binomials: List[UInt32], num_candidates: Int, seated: Int, rank: Int) -> Int:
+    """The subset mask a colex rank names among those seating `seated` of the candidates."""
+    var stride = num_candidates + 1
+    var subset = 0
+    var remaining = seated
+    var position = rank
+    var candidate = num_candidates
+    while remaining != 0 and candidate != 0:
+        candidate -= 1
+        var below = Int(binomials[candidate * stride + remaining])
+        if position < below:
+            continue
+        position -= below
+        subset |= 1 << candidate
+        remaining -= 1
+    return subset
+
+
+def kemeny_ranking(preferences: PreferenceMatrix) raises -> KemenySolution:
     """
     Determines the exact Kemeny-Young consensus ranking and its disagreement score.
 
@@ -99,45 +149,63 @@ def kemeny_ranking(
         preferences: Input preference matrix.
 
     Returns:
-        Tuple of (ranked_candidate_ids, disagreement score).
+        The consensus ranking and the disagreement it achieves.
     """
     var num_candidates = preferences.num_candidates
-
-    # The worst ordering pays the larger side of every pair, so that sum is what the score
-    # type has to hold. Wrapping here would answer confidently and wrongly.
-    var worst_case = UInt64(0)
-    for i in range(num_candidates):
-        for j in range(i + 1, num_candidates):
-            worst_case += UInt64(max(preferences[i, j], preferences[j, i]))
-    if worst_case > UInt64(KemenyScore.MAX):
-        raise Error("Ballot counts exceed what a 32-bit Kemeny score can hold")
+    if num_candidates < 1 or num_candidates > KEMENY_MAX_CANDIDATES:
+        raise Error(
+            "Kemeny is exact to " + String(KEMENY_MAX_CANDIDATES) + " candidates, reaching 64 GiB at that width"
+        )
 
     var sums = KemenySums(preferences)
+    var binomials = binomial_table(num_candidates)
+    var binomials_stride = num_candidates + 1
     var states = 1 << num_candidates
 
     # Entry `subset` is the least disagreement achievable seating those candidates in the
-    # leading places, counting only the pairs inside it. Clearing a bit only ever lowers the
-    # index, so plain increasing order is already a valid topological order.
+    # leading places, counting only the pairs inside it. Clearing a bit drops the population
+    # count by exactly one, so one layer of subsets depends only on the layer below it.
     var costs = List[KemenyScore]()
     costs.resize(states, 0)
-    for subset in range(1, states):
-        var best = KemenyScore.MAX
-        for candidate in range(num_candidates):
-            var bit = 1 << candidate
-            if not subset & bit:
-                continue
-            # Seating this candidate last within the subset costs the votes that preferred
-            # it to each of the others.
-            var rest = subset ^ bit
-            var score = costs[rest] + sums.against(candidate, rest)
-            if score < best:
-                best = score
-        costs[subset] = best
+    var costs_data = costs.unsafe_ptr()
+
+    for seated in range(1, num_candidates + 1):
+        # Copied because a `parallelize` closure capturing the induction variable faults at -O1.
+        var layer_seated = seated
+        var layer_states = Int(binomials[num_candidates * binomials_stride + seated])
+        var chunks = (layer_states + KEMENY_LAYER_CHUNK - 1) // KEMENY_LAYER_CHUNK
+
+        @parameter
+        def fill_layer_chunk(chunk: Int):
+            var first_rank = chunk * KEMENY_LAYER_CHUNK
+            var last_rank = min(first_rank + KEMENY_LAYER_CHUNK, layer_states)
+            var subset = subset_at_colex_rank(binomials, num_candidates, layer_seated, first_rank)
+            for _ in range(first_rank, last_rank):
+                var best = KemenyScore.MAX
+                for candidate in range(num_candidates):
+                    var bit = 1 << candidate
+                    if not subset & bit:
+                        continue
+                    # Seating this candidate last within the subset costs the votes that preferred
+                    # it to each of the others.
+                    var rest = subset ^ bit
+                    var score = costs_data[unsafe_offset=rest] + sums.against(candidate, rest)
+                    if score < best:
+                        best = score
+                costs_data[unsafe_offset=subset] = best
+
+                # Colex order over a layer is numeric order, so the next mask is one Gosper step on.
+                var lowest = subset & -subset
+                var ripple = subset + lowest
+                subset = ripple | (((subset ^ ripple) >> 2) // lowest)
+
+        parallelize[fill_layer_chunk](chunks)
 
     # Walk the choices back out, which recovers the ranking from its last place upwards.
-    var reversed_ranking = List[Int]()
+    var ranking = List[Int]()
     var subset = states - 1
     while subset:
+        var seated_last = -1
         for candidate in range(num_candidates):
             var bit = 1 << candidate
             if not subset & bit:
@@ -145,14 +213,15 @@ def kemeny_ranking(
             var rest = subset ^ bit
             if costs[subset] != costs[rest] + sums.against(candidate, rest):
                 continue
-            reversed_ranking.append(candidate)
-            subset = rest
+            seated_last = candidate
             break
+        if seated_last < 0:
+            raise Error("No candidate in the subset explains its cost, so the table is inconsistent")
+        ranking.append(seated_last)
+        subset ^= 1 << seated_last
 
-    var ranking = List[Int]()
-    for i in range(len(reversed_ranking)):
-        ranking.append(reversed_ranking[len(reversed_ranking) - 1 - i])
-    return (ranking^, Int(costs[states - 1]))
+    ranking.reverse()
+    return KemenySolution(ranking^, Int(costs[states - 1]))
 
 
 # endregion Kemeny

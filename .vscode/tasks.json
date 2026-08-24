@@ -2,52 +2,28 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Compile with NVCC",
+      "label": "Build the CUDA extension",
       "type": "shell",
-      "command": "/usr/local/cuda/bin/nvcc",
-      "args": [
-        "-o",
-        "${workspaceFolder}/build_debug/scalingelections",
-        "${workspaceFolder}/scalingelections.cu",
-        "-Xcompiler",
-        "-fopenmp",
-        "-fsanitize=address",
-        "-fsanitize=undefined",
-        "-g",
-        "-O0",
-        "--std=c++17"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
+      "command": "uv sync --extra cpu --reinstall-package scalingelections",
+      "group": { "kind": "build", "isDefault": true },
       "problemMatcher": ["$gcc"],
-      "detail": "Compiles the code using NVCC"
+      "detail": "Compiles scalingelections.cu through setup.py, against CUDA where nvcc is present"
     },
     {
-      "label": "Compile with GCC",
+      "label": "Build the Mojo artifacts",
       "type": "shell",
-      "command": "g++",
-      "args": [
-        "-o",
-        "${workspaceFolder}/build_debug/scalingelections",
-        "-x",
-        "c++",
-        "${workspaceFolder}/scalingelections.cu",
-        "-fopenmp",
-        "-fsanitize=address",
-        "-fsanitize=undefined",
-        "-g",
-        "-O0",
-        "--std=c++17",
-        "-DSCALING_ELECTIONS_TEST"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": ["$gcc"],
-      "detail": "Compiles the code using GCC"
+      "command": "pixi run build && pixi run build-cli",
+      "group": "build",
+      "problemMatcher": [],
+      "detail": "Writes build/scalingelections_mojo.so and build/scalingelections"
+    },
+    {
+      "label": "Run the test suite",
+      "type": "shell",
+      "command": "uv run --no-sync pytest test.py -q",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": [],
+      "detail": "Cross-checks all three languages against oracles written from the definitions"
     }
   ]
 }

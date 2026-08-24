@@ -20,7 +20,7 @@
     "memcpy",
     "ndarray",
     "njit",
-    "Nsight",
+    
     "nullptr",
     "numba",
     "openmp",

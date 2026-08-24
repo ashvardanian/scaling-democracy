@@ -38,17 +38,18 @@ pixi run mojo build cli.mojo -o build/scalingelections
 See: https://ashvardanian.com/posts/scaling-elections
 """
 
-from std.random import seed
 from std.sys import argv, exit, has_accelerator
 from std.time import perf_counter_ns
 
 from ballots import (
     PreferenceMatrix,
+    SeedGraph,
     StrongestPathsMatrix,
     generate_random_preferences,
 )
 from schulze import (
     TILE_SIZE,
+    ElectionOutcome,
     compute_election_results,
     compute_strongest_paths_gpu,
     compute_strongest_paths_serial,
@@ -58,6 +59,24 @@ from schulze import (
 
 
 # region Benchmarking
+
+
+@fieldwise_init
+struct BaselineState(Copyable, Equatable, ImplicitlyCopyable, Movable, TrivialRegisterPassable):
+    """Whether a run has a result to check the next backend against."""
+
+    var value: UInt8
+
+    def __eq__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+    def __ne__(self, other: Self) -> Bool:
+        return self.value != other.value
+
+    comptime missing = Self(0)
+    """No backend has succeeded yet, so this one's result becomes the baseline."""
+    comptime recorded = Self(1)
+    """A baseline is already held, so this one's result is checked against it."""
 
 
 def run_warmup[
@@ -94,9 +113,9 @@ def profile_and_report[
     repeat: Int,
     num_candidates: Int,
     mut baseline: StrongestPathsMatrix,
-    mut has_baseline: Bool,
-) raises -> Tuple[Int, List[Int]]:
-    """Times one implementation, adopting the first result as the baseline.
+    baseline_state: BaselineState,
+) raises -> ElectionOutcome:
+    """Times one implementation, adopting its result as the baseline when none is held yet.
 
     Returns the winner and the full ranking.
     """
@@ -116,22 +135,19 @@ def profile_and_report[
         )
     )
 
-    if has_baseline:
+    if baseline_state == BaselineState.recorded:
         if validate_against_baseline(result, baseline):
             print("  ✓ Results validated")
         else:
             print("  ✗ Results don't match baseline!")
 
-    var result_tuple = compute_election_results(result)
-    var winner_index = result_tuple[0]
-    var winner_ranking = result_tuple[1].copy()
+    var outcome = compute_election_results(result)
 
-    if not has_baseline:
+    if baseline_state == BaselineState.missing:
         baseline = result^
-        has_baseline = True
 
     print()
-    return (winner_index, winner_ranking^)
+    return outcome^
 
 
 def format_time(elapsed_ns: Int) -> String:
@@ -142,7 +158,9 @@ def format_time(elapsed_ns: Int) -> String:
     else:
         var elapsed_seconds = Float64(elapsed_ns) / 1_000_000_000.0
         var hundredths_of_second = Int(elapsed_seconds * 100.0)
-        return "{}.{}{} s".format(hundredths_of_second // 100, (hundredths_of_second % 100) // 10, hundredths_of_second % 10)
+        return "{}.{}{} s".format(
+            hundredths_of_second // 100, (hundredths_of_second % 100) // 10, hundredths_of_second % 10
+        )
 
 
 def format_throughput(cells_per_sec: Float64) -> String:
@@ -347,33 +365,31 @@ def main():
     print(CONFIGURATION.format(num_candidates, voters_description, warmup, repeat))
 
     print("Generating preferences...")
-    seed(seed_value)
-    var preferences = generate_random_preferences(num_candidates, num_voters)
+    var preferences = generate_random_preferences(num_candidates, num_voters, seed_value)
 
     print("\nBenchmarking\n")
 
     # The first backend that succeeds becomes the baseline the rest validate against.
     var baseline = StrongestPathsMatrix(0)
-    var has_baseline = False
+    var baseline_state = BaselineState.missing
     var winner = 0
     var ranking = List[Int]()
-    var has_winner = False
 
     if selected_by(selector, serial_label):
         try:
-            var outcome = profile_and_report[compute_strongest_paths_serial](
+            var outcome = profile_and_report[compute_strongest_paths_serial[SeedGraph.winning_votes]](
                 serial_label,
                 preferences,
                 warmup,
                 repeat,
                 num_candidates,
                 baseline,
-                has_baseline,
+                baseline_state,
             )
-            if not has_winner:
-                winner = outcome[0]
-                ranking = outcome[1].copy()
-                has_winner = True
+            if baseline_state == BaselineState.missing:
+                winner = outcome.winner
+                ranking = outcome.ranking.copy()
+                baseline_state = BaselineState.recorded
         except error:
             print("  ✗ {} failed: {}\n".format(serial_label, error))
 
@@ -386,12 +402,12 @@ def main():
                 repeat,
                 num_candidates,
                 baseline,
-                has_baseline,
+                baseline_state,
             )
-            if not has_winner:
-                winner = outcome[0]
-                ranking = outcome[1].copy()
-                has_winner = True
+            if baseline_state == BaselineState.missing:
+                winner = outcome.winner
+                ranking = outcome.ranking.copy()
+                baseline_state = BaselineState.recorded
         except error:
             print("  ✗ {} failed: {}\n".format(cpu_label, error))
 
@@ -404,12 +420,12 @@ def main():
                 repeat,
                 num_candidates,
                 baseline,
-                has_baseline,
+                baseline_state,
             )
-            if not has_winner:
-                winner = outcome[0]
-                ranking = outcome[1].copy()
-                has_winner = True
+            if baseline_state == BaselineState.missing:
+                winner = outcome.winner
+                ranking = outcome.ranking.copy()
+                baseline_state = BaselineState.recorded
         except error:
             print("  ✗ {} failed: {}\n".format(simd_label, error))
 
@@ -422,16 +438,16 @@ def main():
                 repeat,
                 num_candidates,
                 baseline,
-                has_baseline,
+                baseline_state,
             )
-            if not has_winner:
-                winner = outcome[0]
-                ranking = outcome[1].copy()
-                has_winner = True
+            if baseline_state == BaselineState.missing:
+                winner = outcome.winner
+                ranking = outcome.ranking.copy()
+                baseline_state = BaselineState.recorded
         except error:
             print("  ✗ {} failed: {}\n".format(gpu_label, error))
 
-    if not has_winner:
+    if baseline_state == BaselineState.missing:
         print(NO_ELECTION_RESULTS)
         return
 

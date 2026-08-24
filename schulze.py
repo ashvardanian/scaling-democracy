@@ -16,7 +16,10 @@ warnings.filterwarnings("ignore", message=".*TBB threading layer.*")
 
 
 TILE_SIZE = 32
-"""The tile edge every backend is compiled for, matching `SCALING_ELECTIONS_TILE` in `types.cuh`."""
+"""The tile edge every backend is compiled for, matching `tile_size_k` in `types.cuh`."""
+
+
+# region Serial
 
 
 @njit
@@ -32,39 +35,45 @@ def compute_strongest_paths_numba_serial(preferences: np.ndarray) -> np.ndarray:
     strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint32)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
-    for i in range(num_candidates):
-        for j in range(num_candidates):
-            if i != j:
-                if preferences[i, j] > preferences[j, i]:
-                    strongest_paths[i, j] = preferences[i, j]
+    for source in range(num_candidates):
+        for target in range(num_candidates):
+            if source != target:
+                if preferences[source, target] > preferences[target, source]:
+                    strongest_paths[source, target] = preferences[source, target]
                 else:
-                    strongest_paths[i, j] = 0
+                    strongest_paths[source, target] = 0
 
     # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm
-    for i in range(num_candidates):
-        for j in range(num_candidates):
-            if i != j:
-                for k in range(num_candidates):
-                    if i != k and j != k:
-                        strongest_paths[j, k] = max(
-                            strongest_paths[j, k],
-                            min(strongest_paths[j, i], strongest_paths[i, k]),
+    for pivot in range(num_candidates):
+        for source in range(num_candidates):
+            if source != pivot:
+                for target in range(num_candidates):
+                    if source != target and pivot != target:
+                        strongest_paths[source, target] = max(
+                            strongest_paths[source, target],
+                            min(strongest_paths[source, pivot], strongest_paths[pivot, target]),
                         )
 
     return strongest_paths
 
 
+# endregion Serial
+
+
+# region Tiled Parallel
+
+
 @njit
 def compute_strongest_paths_tile_numba(
-    c: np.ndarray,
-    c_row: int,
-    c_col: int,
-    a: np.ndarray,
-    a_row: int,
-    a_col: int,
-    b: np.ndarray,
-    b_row: int,
-    b_col: int,
+    output: np.ndarray,
+    output_row: int,
+    output_column: int,
+    left: np.ndarray,
+    left_row: int,
+    left_column: int,
+    right: np.ndarray,
+    right_row: int,
+    right_column: int,
     tile_size: int = TILE_SIZE,
 ):
     """
@@ -77,18 +86,24 @@ def compute_strongest_paths_tile_numba(
 
     # `njit` compiles with `boundscheck=False`, so the tail of a non-divisible matrix has
     # to be clamped here rather than trapped on access.
-    num_candidates = c.shape[0]
-    k_extent = min(tile_size, num_candidates - max(a_col, b_row))
-    i_extent = min(tile_size, num_candidates - max(c_row, a_row))
-    j_extent = min(tile_size, num_candidates - max(c_col, b_col))
+    num_candidates = output.shape[0]
+    pivot_extent = min(tile_size, num_candidates - max(left_column, right_row))
+    row_extent = min(tile_size, num_candidates - max(output_row, left_row))
+    column_extent = min(tile_size, num_candidates - max(output_column, right_column))
 
-    for k in range(k_extent):
-        for i in range(i_extent):
-            for j in range(j_extent):
-                if (c_row + i != c_col + j) and (a_row + i != a_col + k) and (b_row + k != b_col + j):
-                    replacement = min(a[a_row + i, a_col + k], b[b_row + k, b_col + j])
-                    if replacement > c[c_row + i, c_col + j]:
-                        c[c_row + i, c_col + j] = replacement
+    for pivot in range(pivot_extent):
+        for row in range(row_extent):
+            for column in range(column_extent):
+                if (
+                    (output_row + row != output_column + column)
+                    and (left_row + row != left_column + pivot)
+                    and (right_row + pivot != right_column + column)
+                ):
+                    replacement = min(
+                        left[left_row + row, left_column + pivot], right[right_row + pivot, right_column + column]
+                    )
+                    if replacement > output[output_row + row, output_column + column]:
+                        output[output_row + row, output_column + column] = replacement
 
 
 @njit(parallel=True)
@@ -101,104 +116,110 @@ def compute_strongest_paths_numba_parallel(
     This implementation not only parallelizes the outer loop but also tiles the computation, to maximize
     the utilization of CPU caches.
 
-    Space complexity:
-    Time complexity:
+    Space complexity: O(n^2), where n is the number of candidates.
+    Time complexity: O(n^3), where n is the number of candidates.
     """
     num_candidates = preferences.shape[0]
 
     strongest_paths = np.zeros((num_candidates, num_candidates), dtype=np.uint32)
 
     # Step 1: Populate the strongest paths matrix based on direct comparisons
-    for i in range(num_candidates):
-        for j in range(num_candidates):
-            if i != j:
-                if preferences[i, j] > preferences[j, i]:
-                    strongest_paths[i, j] = preferences[i, j]
+    for source in range(num_candidates):
+        for target in range(num_candidates):
+            if source != target:
+                if preferences[source, target] > preferences[target, source]:
+                    strongest_paths[source, target] = preferences[source, target]
                 else:
-                    strongest_paths[i, j] = 0
+                    strongest_paths[source, target] = 0
 
     # Step 2: Compute the strongest paths using Floyd-Warshall-like algorithm with tiling
     tiles_count = (num_candidates + tile_size - 1) // tile_size
-    for k in range(tiles_count):
+    for pivot_tile in range(tiles_count):
         # Dependent phase
-        k_start = k * tile_size
+        pivot_start = pivot_tile * tile_size
 
         # f(S_kk, S_kk, S_kk)
         compute_strongest_paths_tile_numba(
             strongest_paths,
-            k_start,
-            k_start,
+            pivot_start,
+            pivot_start,
             strongest_paths,
-            k_start,
-            k_start,
+            pivot_start,
+            pivot_start,
             strongest_paths,
-            k_start,
-            k_start,
+            pivot_start,
+            pivot_start,
             tile_size,
         )
 
         # Partially dependent phase (first of two)
-        for i in prange(tiles_count):
-            if i == k:
+        for row_tile in prange(tiles_count):
+            if row_tile == pivot_tile:
                 continue
-            i_start = i * tile_size
+            row_start = row_tile * tile_size
             # f(S_ik, S_ik, S_kk)
             compute_strongest_paths_tile_numba(
                 strongest_paths,
-                i_start,
-                k_start,
+                row_start,
+                pivot_start,
                 strongest_paths,
-                i_start,
-                k_start,
+                row_start,
+                pivot_start,
                 strongest_paths,
-                k_start,
-                k_start,
+                pivot_start,
+                pivot_start,
                 tile_size,
             )
 
         # Partially dependent phase (second of two)
-        for j in prange(tiles_count):
-            if j == k:
+        for column_tile in prange(tiles_count):
+            if column_tile == pivot_tile:
                 continue
-            j_start = j * tile_size
+            column_start = column_tile * tile_size
             # f(S_kj, S_kk, S_kj)
             compute_strongest_paths_tile_numba(
                 strongest_paths,
-                k_start,
-                j_start,
+                pivot_start,
+                column_start,
                 strongest_paths,
-                k_start,
-                k_start,
+                pivot_start,
+                pivot_start,
                 strongest_paths,
-                k_start,
-                j_start,
+                pivot_start,
+                column_start,
                 tile_size,
             )
 
         # Independent phase
-        for i in prange(tiles_count):
-            if i == k:
+        for row_tile in prange(tiles_count):
+            if row_tile == pivot_tile:
                 continue
-            i_start = i * tile_size
-            for j in range(tiles_count):
-                if j == k:
+            row_start = row_tile * tile_size
+            for column_tile in range(tiles_count):
+                if column_tile == pivot_tile:
                     continue
-                j_start = j * tile_size
+                column_start = column_tile * tile_size
                 # f(S_ij, S_ik, S_kj)
                 compute_strongest_paths_tile_numba(
                     strongest_paths,
-                    i_start,
-                    j_start,
+                    row_start,
+                    column_start,
                     strongest_paths,
-                    i_start,
-                    k_start,
+                    row_start,
+                    pivot_start,
                     strongest_paths,
-                    k_start,
-                    j_start,
+                    pivot_start,
+                    column_start,
                     tile_size,
                 )
 
     return strongest_paths
+
+
+# endregion Tiled Parallel
+
+
+# region Winners
 
 
 def split_cycle_winners(preferences: np.ndarray, margin_paths: np.ndarray) -> list[int]:
@@ -214,7 +235,7 @@ def split_cycle_winners(preferences: np.ndarray, margin_paths: np.ndarray) -> li
     """
     margins = positive_margins(preferences)
     defeats = (margins > 0) & (margins > margin_paths.astype(np.int64).T)
-    return [i for i in range(preferences.shape[0]) if not defeats[:, i].any()]
+    return [candidate for candidate in range(preferences.shape[0]) if not defeats[:, candidate].any()]
 
 
 def get_winner_and_ranking(
@@ -230,13 +251,16 @@ def get_winner_and_ranking(
     num_candidates = len(candidates)
     wins = np.zeros(num_candidates, dtype=int)
 
-    for i in range(num_candidates):
-        for j in range(num_candidates):
-            if i != j and strongest_paths[i, j] > strongest_paths[j, i]:
-                wins[i] += 1
+    for source in range(num_candidates):
+        for target in range(num_candidates):
+            if source != target and strongest_paths[source, target] > strongest_paths[target, source]:
+                wins[source] += 1
 
-    ranking_indices = sorted(range(num_candidates), key=lambda x: wins[x], reverse=True)
+    ranking_indices = sorted(range(num_candidates), key=lambda candidate: wins[candidate], reverse=True)
     winner = candidates[ranking_indices[0]]
-    ranked_candidates = [candidates[i] for i in ranking_indices]
+    ranked_candidates = [candidates[index] for index in ranking_indices]
 
     return winner, ranked_candidates
+
+
+# endregion Winners

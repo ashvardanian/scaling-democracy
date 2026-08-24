@@ -2,7 +2,7 @@
 authors = [
   {name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com"},
 ]
-dependencies = ["numpy>=2.0"]
+dependencies = ["numba>=0.67", "numpy>=2.0"]
 description = "ScalingElections: Condorcet Voting at GPU Speed — Schulze as semiring matrix multiplication, Kemeny-Young as exact NP-hard search"
 name = "ScalingElections"
 readme = "README.md"
@@ -14,9 +14,15 @@ version = "0.2.0"
 build-backend = "setuptools.build_meta"
 requires = ["setuptools>=83", "pybind11>=3.0.3"]
 
-# NumBa caps NumPy at `<2.5` until 0.67, so the two floors move together.
+# The oracles the suite validates against, which no wheel of this project needs at runtime.
 [project.optional-dependencies]
-cpu = ["numba>=0.67", "pytest>=9.1"]
+cpu = ["igraph>=0.11", "pref-voting>=1.18"]
+
+[tool.uv]
+# The checkers travel with every checkout, so a bare `uv sync` is enough to run the suite.
+default-groups = ["lint", "test"]
+# pref-voting caps numba below 0.63; it runs fine on 0.67, verified against its own methods.
+override-dependencies = ["numba>=0.67"]
 
 [tool.setuptools]
 py-modules = ["scalingelections", "ballots", "schulze", "kemeny"]
@@ -24,6 +30,7 @@ py-modules = ["scalingelections", "ballots", "schulze", "kemeny"]
 [tool.pytest.ini_options]
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
+markers = ["slow: the exhaustive Kemeny searches; deselect with -m 'not slow'"]
 minversion = "6.0"
 xfail_strict = true
 
@@ -50,5 +57,7 @@ select = [
   "SIM", # flake8-simplify
 ]
 
+# Groups rather than extras, so the checkers stay out of the published wheel's metadata.
 [dependency-groups]
 lint = ["ruff>=0.15.8"]
+test = ["pytest>=9.1", "pytest-repeat>=0.9.4"]

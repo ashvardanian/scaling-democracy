@@ -10,6 +10,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build_debug/
 develop-eggs/
 dist/
 downloads/
@@ -163,4 +164,3 @@ cython_debug/
 #.idea/
 # pixi environments
 .pixi
-/scaling_elections

@@ -4,10 +4,18 @@ Every downstream method in this repository consumes the same square matrix, wher
 (i, j) counts the voters preferring candidate i to candidate j.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 from numba import njit
+
+try:  # The tally runs through the extension when one was built, and through Numba otherwise.
+    import scalingelections_cuda as _extension
+except ImportError:
+    _extension = None
+
+
+# region Tally
 
 
 @njit
@@ -19,39 +27,60 @@ def populate_preferences_from_ranking(preferences: np.ndarray, ranking: np.ndarr
     Space complexity: O(n^2), where n is the number of candidates.
     Time complexity: O(n^2), where n is the number of candidates.
     """
-    for i, preferred in enumerate(ranking):
-        for opponent in ranking[i + 1 :]:
+    for position, preferred in enumerate(ranking):
+        for opponent in ranking[position + 1 :]:
             preferences[preferred, opponent] += 1
 
 
-def build_pairwise_preferences(voter_rankings: Sequence[np.ndarray]) -> np.ndarray:
+def complete_rankings(voter_rankings: Iterable[Sequence[int] | np.ndarray], num_candidates: int) -> np.ndarray:
+    """Pads every ballot to a full ranking, placing the candidates it omits last in index order."""
+    rankings = [np.asarray(ranking) for ranking in voter_rankings]
+    complete = np.empty((len(rankings), num_candidates), dtype=np.uint32)
+    for row, ranking in enumerate(rankings):
+        complete[row, : len(ranking)] = ranking
+        if len(ranking) == num_candidates:
+            continue
+        unranked = np.ones(num_candidates, dtype=bool)
+        unranked[ranking] = False
+        complete[row, len(ranking) :] = np.nonzero(unranked)[0]
+    return complete
+
+
+def tally_chunks(chunks: Iterable[np.ndarray], num_candidates: int, backend: str = "auto") -> np.ndarray:
     """
-    For every voter in the population, receives a (potentially incomplete) ranking of candidates,
-    and builds a square preference matrix based on the rankings. Every cell (i, j) in the matrix
-    contains the number of voters who prefer candidate i to candidate j.
-    The candidate must be represented as monotonic integers starting from 0.
-    If some candidates aren't included in a specific ranking, to break ties between them, random
-    ballots are generated.
+    Sums one pairwise matrix over any number of chunks of complete rankings.
 
-    Space complexity: O(n^2), where n is the number of candidates.
-    Time complexity: O(m * n^2), where n is the number of candidates and m is the number of voters.
+    Taking chunks rather than one array is what keeps a national electorate off the heap: only the
+    chunk in hand and the matrix itself are ever resident.
     """
-    # The number of candidates is the maximum candidate index in the rankings plus one.
-    count_candidates = 1
-    for ranking in voter_rankings:
-        count_candidates = max(count_candidates, np.max(ranking) + 1)
-
-    preferences = np.zeros((count_candidates, count_candidates), dtype=np.uint32)
-
-    for ranking in voter_rankings:
-        # A ballot that omits candidates ranks every one of them last, in index order.
-        if len(ranking) != count_candidates:
-            unranked = np.ones(count_candidates, dtype=bool)
-            unranked[ranking] = False
-            ranking = np.append(ranking, np.nonzero(unranked)[0])
-        populate_preferences_from_ranking(preferences, ranking)
-
+    preferences = np.zeros((num_candidates, num_candidates), dtype=np.uint32)
+    for chunk in chunks:
+        chunk = np.ascontiguousarray(chunk, dtype=np.uint32)
+        if chunk.ndim != 2 or chunk.shape[1] != num_candidates:
+            raise ValueError(f"Every chunk must be 2-D and {num_candidates} wide, got {chunk.shape}")
+        if _extension is not None:
+            preferences += _extension.tally_ballots(chunk, backend=backend)
+            continue
+        for ranking in chunk:
+            populate_preferences_from_ranking(preferences, ranking)
     return preferences
+
+
+def build_pairwise_preferences(
+    voter_rankings: Iterable[Sequence[int] | np.ndarray],
+    num_candidates: int | None = None,
+    backend: str = "auto",
+) -> np.ndarray:
+    """
+    Counts, for every ordered pair, the ballots preferring the first candidate to the second.
+
+    Ballots may omit candidates, in which case every omitted one is ranked last in index order.
+    Pass `num_candidates` to skip the pass that would otherwise read every ballot to find it.
+    """
+    rankings = [np.asarray(ranking) for ranking in voter_rankings]
+    if num_candidates is None:
+        num_candidates = 1 + max((int(np.max(ranking)) for ranking in rankings if len(ranking)), default=0)
+    return tally_chunks([complete_rankings(rankings, num_candidates)], num_candidates, backend)
 
 
 def generate_preferences(num_candidates: int, num_voters: int, generator: np.random.Generator) -> np.ndarray:
@@ -70,6 +99,12 @@ def generate_preferences(num_candidates: int, num_voters: int, generator: np.ran
     return build_pairwise_preferences(voter_rankings)
 
 
+# endregion Tally
+
+
+# region Graphs
+
+
 def positive_margins(preferences: np.ndarray) -> np.ndarray:
     """
     Rewrites pairwise counts so the strongest-paths kernel closes over margins.
@@ -83,3 +118,6 @@ def positive_margins(preferences: np.ndarray) -> np.ndarray:
     """
     signed = preferences.astype(np.int64)
     return np.maximum(signed - signed.T, 0).astype(np.uint32)
+
+
+# endregion Graphs
