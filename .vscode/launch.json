@@ -15,7 +15,7 @@
       "name": "Debug with GDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/scaling_elections",
+      "program": "${workspaceFolder}/build_debug/scalingelections",
       "args": [],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",

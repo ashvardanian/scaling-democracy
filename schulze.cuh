@@ -1,101 +1,16 @@
 /**
- *  @brief CUDA-accelerated Schulze voting algorithm implementation.
- *  @file scaling_elections.cu
+ *  @brief Block-parallel Schulze strongest-paths kernels for CUDA, HIP, and OpenMP.
+ *  @file schulze.cuh
  *  @author Ash Vardanian
  *  @date July 12, 2024
  *  @see https://ashvardanian.com/posts/scaling-elections
  */
-#include <csignal> // `std::signal`
-#include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `std::printf`
-#include <cstdlib> // `std::rand`
+#pragma once
+#include "ballots.cuh"
+#include "types.cuh"
 
-#include <algorithm>   // `std::min`, `std::max`
-#include <numeric>     // `std::accumulate`
-#include <optional>    // `std::optional`, `std::nullopt`
-#include <stdexcept>   // `std::runtime_error`
-#include <string>      // `std::to_string`
-#include <string_view> // `std::string_view`
-#include <thread>      // `std::thread::hardware_concurrency()`
-#include <type_traits> // `std::integral_constant`, `std::is_same`
-#include <vector>      // `std::vector`
-
-// OpenMP support detection
-#if defined(_OPENMP)
-#include <omp.h> // `omp_set_num_threads`
-#define SCALING_ELECTIONS_WITH_OPENMP (1)
-#endif
-
-#if (defined(__ARM_NEON) || defined(__aarch64__))
-#define SCALING_ELECTIONS_WITH_NEON (1)
-#endif
-#if defined(__NVCC__)
-#define SCALING_ELECTIONS_WITH_CUDA (1)
-#endif
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
-#define SCALING_ELECTIONS_WITH_HIP  (1)
-#define SCALING_ELECTIONS_WITH_CUDA (1) // HIP is CUDA-compatible
-#endif
-
-#if defined(SCALING_ELECTIONS_WITH_NEON)
-#include <arm_neon.h>
-#endif
-
-#if defined(SCALING_ELECTIONS_WITH_CUDA) && !defined(SCALING_ELECTIONS_WITH_HIP)
-// NVIDIA CUDA headers
-#include <cuda.h> // `CUtensorMap`
-#include <cuda/barrier>
-#include <cudaTypedefs.h> // `PFN_cuTensorMapEncodeTiled`
-#include <cuda_runtime.h>
-#include <thrust/device_vector.h>
-#include <thrust/execution_policy.h>
-
-// AMD HIP headers (CUDA-compatible)
-#elif defined(SCALING_ELECTIONS_WITH_HIP)
-#include <hip/hip_runtime.h>
-
-// HIP compatibility layer: map CUDA types/functions to HIP equivalents
-#if defined(__HIP_PLATFORM_AMD__)
-#define cudaError_t             hipError_t
-#define cudaSuccess             hipSuccess
-#define cudaGetDevice           hipGetDevice
-#define cudaGetDeviceProperties hipGetDeviceProperties
-#define cudaDeviceProp          hipDeviceProp_t
-#define cudaMallocManaged       hipMallocManaged
-#define cudaFree                hipFree
-#define cudaMemcpy              hipMemcpy
-#define cudaMemcpyDeviceToHost  hipMemcpyDeviceToHost
-#define cudaMemcpyHostToDevice  hipMemcpyHostToDevice
-#define cudaMemset              hipMemset
-#define cudaDeviceSynchronize   hipDeviceSynchronize
-#define cudaGetLastError        hipGetLastError
-#define cudaGetErrorString      hipGetErrorString
-#define cudaGetDeviceCount      hipGetDeviceCount
-
-#endif
-#endif
-
-// Raw-kernel test builds link no Python.
-#if !defined(SCALING_ELECTIONS_TEST)
-#include <pybind11/numpy.h> // `array_t`
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-
-namespace py = pybind11;
-#endif
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300 && !defined(SCALING_ELECTIONS_WITH_HIP)
-#define SCALING_ELECTIONS_KEPLER (1)
-#endif
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(SCALING_ELECTIONS_WITH_HIP)
-#define SCALING_ELECTIONS_HOPPER (1)
-#endif
-
-using votes_count_t = std::uint32_t;
-using candidate_index_t = std::uint32_t;
-
-template <std::uint32_t tile_size_>
-using votes_count_tile = votes_count_t[tile_size_][tile_size_];
+template <std::uint32_t tile_size_, typename element_type_ = votes_count_t>
+using votes_count_tile = element_type_[tile_size_][tile_size_];
 
 /**
  *  @brief Which tile phase a processor runs, fixing both buffer aliasing and diagonal handling.
@@ -104,79 +19,26 @@ using votes_count_tile = votes_count_t[tile_size_][tile_size_];
  *  pairing of the underlying flags cannot be spelled.
  */
 enum class tile_phase_t : std::uint8_t {
-    /** @brief Output and inputs share one buffer, so every step needs a barrier. */
+    /** Output and inputs share one buffer, so every step needs a barrier. */
     aliased_k,
-    /** @brief Separate buffers, but the tile may straddle the matrix diagonal. */
+    /** Separate buffers, but the tile may straddle the matrix diagonal. */
     distinct_diagonal_k,
-    /** @brief Separate buffers, provably off the diagonal, so the update is a plain maximum. */
+    /** Separate buffers, provably off the diagonal, so the update is a plain maximum. */
     distinct_independent_k,
 };
 
-/** @brief Whether a tile copy bounds-checks its edges; `checked_k` also disables the NEON path. */
+/** Whether a tile copy bounds-checks its edges; `checked_k` also disables the NEON path. */
 enum class tile_march_t : bool { fast_k = true, checked_k = false };
 
-/** @brief Which family computes the strongest paths. */
+/** Which family computes the strongest paths. */
 enum class backend_t : std::uint8_t {
-    /** @brief Tiled CPU kernels across an OpenMP team. */
+    /** Tiled CPU kernels across an OpenMP team. */
     cpu_openmp_k,
-    /** @brief Tiled GPU kernels staging tiles through per-thread loads, on CUDA or HIP. */
+    /** Tiled GPU kernels staging tiles through per-thread loads, on CUDA or HIP. */
     gpu_serial_k,
-    /** @brief Tiled GPU kernels staging tiles through the bulk-tensor engine, NVIDIA sm_90 and newer. */
+    /** Tiled GPU kernels staging tiles through the bulk-tensor engine, NVIDIA sm_90 and newer. */
     gpu_hopper_k,
 };
-
-/** @brief Resolves the name the Python layer passes, throwing on anything unrecognized. */
-inline backend_t backend_from_name(std::string_view name) {
-    if (name == "cpu_openmp") return backend_t::cpu_openmp_k;
-    if (name == "gpu_serial") return backend_t::gpu_serial_k;
-    if (name == "gpu_hopper") return backend_t::gpu_hopper_k;
-    throw std::invalid_argument("Backend must be one of: cpu_openmp, gpu_serial, gpu_hopper");
-}
-
-/**
- *  @brief The closed set of tile sizes a backend instantiates, lowered onto compile-time constants.
- *
- *  The sizes must be listed in ascending order, which @c largest_fitting relies on.
- */
-template <std::uint32_t... tile_sizes_>
-struct tile_ladder {
-
-    static constexpr bool ascending() noexcept {
-        constexpr std::uint32_t sizes[] = {tile_sizes_...};
-        for (std::size_t index = 1; index < sizeof...(tile_sizes_); ++index)
-            if (sizes[index] <= sizes[index - 1]) return false;
-        return true;
-    }
-    static_assert(ascending(), "Tile sizes must be listed in ascending order");
-
-    /** @brief Whether @p tile_size is one of the instantiated sizes. */
-    static constexpr bool contains(std::size_t tile_size) noexcept { return ((tile_size == tile_sizes_) || ...); }
-
-    /** @brief The largest size not exceeding @p num_candidates, or zero when none fits. */
-    static constexpr std::uint32_t largest_fitting(candidate_index_t num_candidates) noexcept {
-        std::uint32_t best = 0;
-        (((tile_sizes_ <= num_candidates) && (best = tile_sizes_, true)), ...);
-        return best;
-    }
-
-    /** @brief Invokes @p callback with the matching size as an integral constant, or returns false. */
-    template <typename callback_type_>
-    static bool dispatch(std::size_t tile_size, callback_type_&& callback) {
-        return ((tile_size == tile_sizes_ ? (callback(std::integral_constant<std::uint32_t, tile_sizes_> {}), true)
-                                          : false) ||
-                ...);
-    }
-};
-
-using cpu_tiles_t = tile_ladder<4, 8, 16, 32, 64, 128>;
-using gpu_tiles_t = tile_ladder<4, 8, 16, 32>;
-
-/**
- *  @brief Stores the interrupt signal status.
- */
-volatile std::sig_atomic_t global_signal_status = 0;
-
-void signal_handler(int signal) { global_signal_status = signal; }
 
 #pragma region CUDA
 
@@ -187,20 +49,23 @@ namespace cde = cuda::device::experimental;
 using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 #endif
 
-/** @brief Owns one managed reservation for the padded strongest-paths matrix. */
-struct managed_graph_t {
-    votes_count_t* pointer = nullptr;
+/** Owns one managed reservation for the padded strongest-paths matrix. */
+template <typename element_type_>
+struct managed_graph {
+    element_type_* pointer = nullptr;
 
-    explicit managed_graph_t(std::size_t bytes) {
+    explicit managed_graph(std::size_t bytes) {
         if (cudaMallocManaged(&pointer, bytes) != cudaSuccess)
             throw std::runtime_error("Failed to allocate memory on device");
     }
-    ~managed_graph_t() noexcept {
+    ~managed_graph() noexcept {
         if (pointer) cudaFree(pointer);
     }
-    managed_graph_t(managed_graph_t const&) = delete;
-    managed_graph_t& operator=(managed_graph_t const&) = delete;
+    managed_graph(managed_graph const&) = delete;
+    managed_graph& operator=(managed_graph const&) = delete;
 };
+
+using managed_graph_t = managed_graph<votes_count_t>;
 
 #if defined(SCALING_ELECTIONS_KEPLER)
 
@@ -210,25 +75,26 @@ struct managed_graph_t {
  *
  *  @tparam tile_size_ The size of the tile to be processed.
  *  @tparam phase_ Whether the tiles alias and whether the tile may straddle the diagonal.
+ *  @tparam element_type_ The width one vote count occupies, deduced from the tiles.
  *
  *  Tile @p c is the output, @p a and @p b the inputs; @p bi and @p bj address a cell within a
  *  tile, and each @p *_row and @p *_col pair the tile's origin in the global matrix.
  */
-template <std::uint32_t tile_size_, tile_phase_t phase_>
-__forceinline__ __device__ void process_tile_cuda_(   //
-    votes_count_tile<tile_size_>& c,                  //
-    votes_count_tile<tile_size_> const& a,            //
-    votes_count_tile<tile_size_> const& b,            //
-    candidate_index_t bi, candidate_index_t bj,       //
-    candidate_index_t c_row, candidate_index_t c_col, //
-    candidate_index_t a_row, candidate_index_t a_col, //
+template <std::uint32_t tile_size_, tile_phase_t phase_, typename element_type_>
+__forceinline__ __device__ void process_tile_cuda_(       //
+    votes_count_tile<tile_size_, element_type_>& c,       //
+    votes_count_tile<tile_size_, element_type_> const& a, //
+    votes_count_tile<tile_size_, element_type_> const& b, //
+    candidate_index_t bi, candidate_index_t bj,           //
+    candidate_index_t c_row, candidate_index_t c_col,     //
+    candidate_index_t a_row, candidate_index_t a_col,     //
     candidate_index_t b_row, candidate_index_t b_col) {
 
-    votes_count_t& c_cell = c[bi][bj];
+    element_type_& c_cell = c[bi][bj];
 
 #pragma unroll tile_size_
     for (candidate_index_t k = 0; k < tile_size_; k++) {
-        votes_count_t smallest = umin(a[bi][k], b[k][bj]);
+        element_type_ smallest = umin(a[bi][k], b[k][bj]);
         if constexpr (phase_ != tile_phase_t::distinct_independent_k) {
             std::uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
             std::uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
@@ -236,7 +102,7 @@ __forceinline__ __device__ void process_tile_cuda_(   //
             std::uint32_t is_bigger = smallest > c_cell;
             std::uint32_t will_replace = is_not_diagonal_c & is_not_diagonal_a & is_not_diagonal_b & is_bigger;
             // On Kepler an newer we can use `__funnelshift_lc` to avoid branches
-            c_cell = __funnelshift_lc(c_cell, smallest, will_replace - 1);
+            c_cell = static_cast<element_type_>(__funnelshift_lc(c_cell, smallest, will_replace - 1));
         }
         else c_cell = umax(c_cell, smallest);
         if constexpr (phase_ == tile_phase_t::aliased_k) __syncthreads();
@@ -251,25 +117,26 @@ __forceinline__ __device__ void process_tile_cuda_(   //
  *
  *  @tparam tile_size_ The size of the tile to be processed.
  *  @tparam phase_ Whether the tiles alias and whether the tile may straddle the diagonal.
+ *  @tparam element_type_ The width one vote count occupies, deduced from the tiles.
  *
  *  Tile @p c is the output, @p a and @p b the inputs; @p bi and @p bj address a cell within a
  *  tile, and each @p *_row and @p *_col pair the tile's origin in the global matrix.
  */
-template <std::uint32_t tile_size_, tile_phase_t phase_>
-__forceinline__ __device__ void process_tile_cuda_(   //
-    votes_count_tile<tile_size_>& c,                  //
-    votes_count_tile<tile_size_> const& a,            //
-    votes_count_tile<tile_size_> const& b,            //
-    candidate_index_t bi, candidate_index_t bj,       //
-    candidate_index_t c_row, candidate_index_t c_col, //
-    candidate_index_t a_row, candidate_index_t a_col, //
+template <std::uint32_t tile_size_, tile_phase_t phase_, typename element_type_>
+__forceinline__ __device__ void process_tile_cuda_(       //
+    votes_count_tile<tile_size_, element_type_>& c,       //
+    votes_count_tile<tile_size_, element_type_> const& a, //
+    votes_count_tile<tile_size_, element_type_> const& b, //
+    candidate_index_t bi, candidate_index_t bj,           //
+    candidate_index_t c_row, candidate_index_t c_col,     //
+    candidate_index_t a_row, candidate_index_t a_col,     //
     candidate_index_t b_row, candidate_index_t b_col) {
 
-    votes_count_t& c_cell = c[bi][bj];
+    element_type_& c_cell = c[bi][bj];
 
 #pragma unroll tile_size_
     for (candidate_index_t k = 0; k < tile_size_; k++) {
-        votes_count_t smallest = min(a[bi][k], b[k][bj]);
+        element_type_ smallest = min(a[bi][k], b[k][bj]);
         if constexpr (phase_ != tile_phase_t::distinct_independent_k) {
             std::uint32_t is_not_diagonal_c = (c_row + bi) != (c_col + bj);
             std::uint32_t is_not_diagonal_a = (a_row + bi) != (a_col + k);
@@ -289,16 +156,17 @@ __forceinline__ __device__ void process_tile_cuda_(   //
  *  @brief Performs the diagonal step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  *  @tparam tile_size_ The size of the tile to be processed.
+ *  @tparam element_type_ The width one vote count occupies.
  *  @param[in] n The number of candidates.
  *  @param[in] k The index of the current tile being processed.
  *  @param[inout] graph The graph of strongest paths.
  */
-template <std::uint32_t tile_size_>
-__global__ void cuda_diagonal_(candidate_index_t n, candidate_index_t k, votes_count_t* graph) {
+template <std::uint32_t tile_size_, typename element_type_ = votes_count_t>
+__global__ void cuda_diagonal_(candidate_index_t n, candidate_index_t k, element_type_* graph) {
     candidate_index_t const bi = threadIdx.y;
     candidate_index_t const bj = threadIdx.x;
 
-    alignas(16) __shared__ votes_count_t c[tile_size_][tile_size_];
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> c;
     c[bi][bj] = graph[k * tile_size_ * n + k * tile_size_ + bi * n + bj];
 
     __syncthreads();
@@ -316,21 +184,22 @@ __global__ void cuda_diagonal_(candidate_index_t n, candidate_index_t k, votes_c
  *  @brief Performs the partially independent step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  *  @tparam tile_size_ The size of the tile to be processed.
+ *  @tparam element_type_ The width one vote count occupies.
  *  @param[in] n The number of candidates.
  *  @param[in] k The index of the current tile being processed.
  *  @param[inout] graph The graph of strongest paths.
  */
-template <std::uint32_t tile_size_>
-__global__ void cuda_partially_independent_(candidate_index_t n, candidate_index_t k, votes_count_t* graph) {
+template <std::uint32_t tile_size_, typename element_type_ = votes_count_t>
+__global__ void cuda_partially_independent_(candidate_index_t n, candidate_index_t k, element_type_* graph) {
     candidate_index_t const i = blockIdx.x;
     candidate_index_t const bi = threadIdx.y;
     candidate_index_t const bj = threadIdx.x;
 
     if (i == k) return;
 
-    alignas(16) __shared__ votes_count_tile<tile_size_> a;
-    alignas(16) __shared__ votes_count_tile<tile_size_> b;
-    alignas(16) __shared__ votes_count_tile<tile_size_> c;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> a;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> b;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> c;
 
     // Partially dependent phase (first of two)
     // Walking down within a group of adjacent columns
@@ -366,12 +235,13 @@ __global__ void cuda_partially_independent_(candidate_index_t n, candidate_index
  *  @brief Performs then independent step of the block-parallel Schulze voting algorithm in CUDA or @b HIP.
  *
  *  @tparam tile_size_ The size of the tile to be processed.
+ *  @tparam element_type_ The width one vote count occupies.
  *  @param[in] n The number of candidates.
  *  @param[in] k The index of the current tile being processed.
  *  @param[inout] graph The graph of strongest paths.
  */
-template <std::uint32_t tile_size_>
-__global__ void cuda_independent_(candidate_index_t n, candidate_index_t k, votes_count_t* graph) {
+template <std::uint32_t tile_size_, typename element_type_ = votes_count_t>
+__global__ void cuda_independent_(candidate_index_t n, candidate_index_t k, element_type_* graph) {
     candidate_index_t const j = blockIdx.x;
     candidate_index_t const i = blockIdx.y;
     candidate_index_t const bi = threadIdx.y;
@@ -379,9 +249,9 @@ __global__ void cuda_independent_(candidate_index_t n, candidate_index_t k, vote
 
     if (i == k && j == k) return;
 
-    alignas(16) __shared__ votes_count_tile<tile_size_> a;
-    alignas(16) __shared__ votes_count_tile<tile_size_> b;
-    alignas(16) __shared__ votes_count_tile<tile_size_> c;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> a;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> b;
+    alignas(16) __shared__ votes_count_tile<tile_size_, element_type_> c;
 
     c[bi][bj] = graph[i * tile_size_ * n + j * tile_size_ + bi * n + bj];
     a[bi][bj] = graph[i * tile_size_ * n + k * tile_size_ + bi * n + bj];
@@ -405,6 +275,116 @@ __global__ void cuda_independent_(candidate_index_t n, candidate_index_t k, vote
 
     graph[i * tile_size_ * n + j * tile_size_ + bi * n + bj] = c[bi][bj];
 }
+
+#pragma region Packed Sixteen Bit
+
+/** Which element width the pivot sweep runs on. */
+enum class graph_width_t : std::uint8_t {
+    /** The 32-bit path, which every device and every backend supports. */
+    wide_32_k,
+    /** The 16-bit path, two candidates per word, needing every vote count below 65536. */
+    narrow_16_k,
+};
+
+/** Copies the graph into a narrower shadow, raising @p overflowed for any cell that will not fit. */
+template <typename wide_type_, typename narrow_type_>
+__global__ void cuda_narrow_(std::size_t cells, wide_type_ const* wide, narrow_type_* narrow, wide_type_* overflowed) {
+    std::size_t const stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    std::size_t const first = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    constexpr wide_type_ widest = static_cast<narrow_type_>(~static_cast<narrow_type_>(0));
+    for (std::size_t cell = first; cell < cells; cell += stride) {
+        wide_type_ const value = wide[cell];
+        if (value > widest) *overflowed = 1;
+        narrow[cell] = static_cast<narrow_type_>(value);
+    }
+}
+
+/** Copies the narrow shadow back over the graph the caller owns. */
+template <typename wide_type_, typename narrow_type_>
+__global__ void cuda_widen_(std::size_t cells, narrow_type_ const* narrow, wide_type_* wide) {
+    std::size_t const stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    std::size_t const first = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (std::size_t cell = first; cell < cells; cell += stride) wide[cell] = narrow[cell];
+}
+
+#if !defined(SCALING_ELECTIONS_WITH_HIP)
+
+/**
+ *  @brief Performs the independent step on a 16-bit graph, two candidates per 32-bit word.
+ *
+ *  @tparam tile_size_ The size of the tile to be processed.
+ *  @param[in] words_per_row The row stride of the packed matrix, counted in 32-bit words.
+ *  @param[in] k The index of the current tile being processed.
+ *  @param[inout] graph The graph of strongest paths, viewed as pairs of adjacent vote counts.
+ *
+ *  Each thread owns two words, so one block covers a tile with a quarter of the threads the
+ *  32-bit kernel needs. The max-min semiring has no packed primitive, so the pair is spelled as
+ *  a three-way minimum with a repeated argument, then a three-way maximum.
+ */
+template <std::uint32_t tile_size_>
+__global__ void cuda_independent_packed_(candidate_index_t words_per_row, candidate_index_t k, std::uint32_t* graph) {
+    static_assert(tile_size_ % 4 == 0, "A packed tile row must divide evenly across the lanes");
+    constexpr std::uint32_t tile_words_ = tile_size_ / 2;
+    constexpr std::uint32_t words_per_thread_ = 2;
+    constexpr std::uint32_t lanes_ = tile_words_ / words_per_thread_;
+
+    candidate_index_t const j = blockIdx.x;
+    candidate_index_t const i = blockIdx.y;
+    candidate_index_t const bi = threadIdx.y;
+    candidate_index_t const lane = threadIdx.x;
+
+    if (i == k && j == k) return;
+
+    alignas(16) __shared__ std::uint32_t a[tile_size_][tile_words_];
+    alignas(16) __shared__ std::uint32_t b[tile_size_][tile_words_];
+    alignas(16) __shared__ std::uint32_t c[tile_size_][tile_words_];
+
+    // Staging strides by the lane count so each warp reads one contiguous run.
+#pragma unroll
+    for (std::uint32_t slice = 0; slice < words_per_thread_; slice++) {
+        candidate_index_t const word = lane + slice * lanes_;
+        c[bi][word] = graph[(i * tile_size_ + bi) * words_per_row + j * tile_words_ + word];
+        a[bi][word] = graph[(i * tile_size_ + bi) * words_per_row + k * tile_words_ + word];
+        b[bi][word] = graph[(k * tile_size_ + bi) * words_per_row + j * tile_words_ + word];
+    }
+    __syncthreads();
+
+    candidate_index_t const first_word = lane * words_per_thread_;
+    candidate_index_t const diagonal_word = bi / 2;
+    uint2 c_pair = *reinterpret_cast<uint2 const*>(&c[bi][first_word]);
+    std::uint32_t const diagonal_before = diagonal_word == first_word ? c_pair.x : c_pair.y;
+
+#pragma unroll tile_size_
+    for (candidate_index_t step = 0; step < tile_size_; step++) {
+        std::uint32_t const a_word = a[bi][step / 2];
+        std::uint32_t const a_pair = __byte_perm(a_word, 0u, (step % 2) ? 0x3232u : 0x1010u);
+        uint2 const b_pair = *reinterpret_cast<uint2 const*>(&b[step][first_word]);
+        std::uint32_t const smallest_low = __vimin3_u16x2(a_pair, b_pair.x, b_pair.x);
+        std::uint32_t const smallest_high = __vimin3_u16x2(a_pair, b_pair.y, b_pair.y);
+        c_pair.x = __vimax3_u16x2(c_pair.x, smallest_low, smallest_low);
+        c_pair.y = __vimax3_u16x2(c_pair.y, smallest_high, smallest_high);
+    }
+
+    // A tile straddling the matrix diagonal leaves those cells at the semiring identity.
+    if (i == j) {
+        std::uint32_t const keep_diagonal = (bi % 2) ? 0x7610u : 0x3254u;
+        if (diagonal_word == first_word) c_pair.x = __byte_perm(c_pair.x, diagonal_before, keep_diagonal);
+        else if (diagonal_word == first_word + 1) c_pair.y = __byte_perm(c_pair.y, diagonal_before, keep_diagonal);
+    }
+
+    *reinterpret_cast<uint2*>(&c[bi][first_word]) = c_pair;
+    __syncthreads();
+
+#pragma unroll
+    for (std::uint32_t slice = 0; slice < words_per_thread_; slice++) {
+        candidate_index_t const word = lane + slice * lanes_;
+        graph[(i * tile_size_ + bi) * words_per_row + j * tile_words_ + word] = c[bi][word];
+    }
+}
+
+#endif // !defined(SCALING_ELECTIONS_WITH_HIP)
+
+#pragma endregion Packed Sixteen Bit
 
 /**
  *  @brief Performs then independent step of the block-parallel Schulze voting algorithm in CUDA (NVIDIA Hopper only).
@@ -527,7 +507,7 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
 
 #if !defined(SCALING_ELECTIONS_WITH_HIP)
 
-/** @brief Tensor map for the Hopper bulk-tensor path, absent when the device or the layout rules it out. */
+/** Tensor map for the Hopper bulk-tensor path, absent when the device or the layout rules it out. */
 using tma_descriptor_t = std::optional<CUtensorMap>;
 
 /**
@@ -604,7 +584,7 @@ void launch_independent_(dim3 grid, dim3 block, candidate_index_t graph_stride, 
     else cuda_independent_<tile_size_><<<grid, block>>>(graph_stride, k, graph);
 }
 
-/** @brief Builds the descriptor the bulk-tensor path needs, throwing when the device cannot supply one. */
+/** Builds the descriptor the bulk-tensor path needs, throwing when the device cannot supply one. */
 template <std::uint32_t tile_size_>
 tma_descriptor_t require_tma_(votes_count_t* graph, candidate_index_t graph_stride,
                               cudaDeviceProp const& device_properties) {
@@ -618,7 +598,7 @@ tma_descriptor_t require_tma_(votes_count_t* graph, candidate_index_t graph_stri
 
 #else
 
-/** @brief HIP has no bulk-tensor engine, so the descriptor type can never hold one. */
+/** HIP has no bulk-tensor engine, so the descriptor type can never hold one. */
 using tma_descriptor_t = std::nullopt_t;
 
 template <std::uint32_t tile_size_>
@@ -632,13 +612,119 @@ void launch_independent_(dim3 grid, dim3 block, candidate_index_t graph_stride, 
     cuda_independent_<tile_size_><<<grid, block>>>(graph_stride, k, graph);
 }
 
-/** @brief HIP has no bulk-tensor engine, so the descriptor can never be built. */
+/** HIP has no bulk-tensor engine, so the descriptor can never be built. */
 template <std::uint32_t tile_size_>
 tma_descriptor_t require_tma_(votes_count_t*, candidate_index_t, cudaDeviceProp const&) {
     throw std::runtime_error("The `gpu_hopper` backend is unavailable in a HIP build");
 }
 
 #endif
+
+#if !defined(SCALING_ELECTIONS_WITH_HIP)
+
+#if defined(__CUDA_ARCH_LIST__)
+/** Whether this build carries native sm_90 code, where packed min-max is a single instruction. */
+constexpr bool carries_native_packed_min_max() {
+    for (int compiled : {__CUDA_ARCH_LIST__})
+        if (compiled >= 900) return true;
+    return false;
+}
+#else
+/** Without an architecture list the build cannot promise a native packed min-max. */
+constexpr bool carries_native_packed_min_max() { return false; }
+#endif
+
+/**
+ *  @brief Picks the width the sweep would prefer, before any vote count has been looked at.
+ *
+ *  Below sm_90 the packed intrinsics are emulated and lose to the 32-bit path, so both the
+ *  compiled architectures and the running device have to offer the real instruction.
+ */
+template <std::uint32_t tile_size_>
+graph_width_t choose_width_(backend_t backend, cudaDeviceProp const& device_properties) {
+    if constexpr (tile_size_ % 4 != 0) return graph_width_t::wide_32_k;
+    else {
+        if (backend != backend_t::gpu_serial_k) return graph_width_t::wide_32_k;
+        if (!carries_native_packed_min_max()) return graph_width_t::wide_32_k;
+        if (device_properties.major < 9) return graph_width_t::wide_32_k;
+        return graph_width_t::narrow_16_k;
+    }
+}
+
+/** Runs every pivot step on the 16-bit shadow, with the independent phase packed two per word. */
+template <std::uint32_t tile_size_>
+void sweep_narrow_(candidate_index_t graph_stride, std::uint16_t* graph) {
+    candidate_index_t const tiles_count = graph_stride / tile_size_;
+    dim3 const tile_shape(tile_size_, tile_size_, 1);
+    dim3 const packed_shape(tile_size_ / 4, tile_size_, 1);
+    dim3 const independent_grid(tiles_count, tiles_count, 1);
+    for (candidate_index_t k = 0; k < tiles_count; k++) {
+        cuda_diagonal_<tile_size_, std::uint16_t><<<1, tile_shape>>>(graph_stride, k, graph);
+        cuda_partially_independent_<tile_size_, std::uint16_t><<<tiles_count, tile_shape>>>(graph_stride, k, graph);
+        cuda_independent_packed_<tile_size_>
+            <<<independent_grid, packed_shape>>>(graph_stride / 2, k, reinterpret_cast<std::uint32_t*>(graph));
+
+        cudaError_t const error = cudaGetLastError();
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
+}
+
+#else
+
+/** HIP has no packed 16-bit min-max, so the sweep never narrows. */
+template <std::uint32_t tile_size_>
+graph_width_t choose_width_(backend_t, cudaDeviceProp const&) {
+    return graph_width_t::wide_32_k;
+}
+
+/** HIP has no packed 16-bit min-max, so the narrow sweep can never run. */
+template <std::uint32_t tile_size_>
+void sweep_narrow_(candidate_index_t, std::uint16_t*) {
+    throw std::runtime_error("The packed 16-bit path is unavailable in a HIP build");
+}
+
+#endif
+
+/** Runs every pivot step on the 32-bit graph, through whichever independent kernel the backend names. */
+template <std::uint32_t tile_size_>
+void sweep_wide_(candidate_index_t graph_stride, votes_count_t* graph, tma_descriptor_t const& tma, backend_t backend) {
+    candidate_index_t const tiles_count = graph_stride / tile_size_;
+    dim3 const tile_shape(tile_size_, tile_size_, 1);
+    dim3 const independent_grid(tiles_count, tiles_count, 1);
+    for (candidate_index_t k = 0; k < tiles_count; k++) {
+        cuda_diagonal_<tile_size_><<<1, tile_shape>>>(graph_stride, k, graph);
+        cuda_partially_independent_<tile_size_><<<tiles_count, tile_shape>>>(graph_stride, k, graph);
+        launch_independent_<tile_size_>(independent_grid, tile_shape, graph_stride, k, graph, tma, backend);
+
+        cudaError_t const error = cudaGetLastError();
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
+}
+
+/** How many blocks a flat pass over @p cells needs, capped so the grid stays resident. */
+inline std::uint32_t flat_blocks_(std::size_t cells, std::uint32_t threads_per_block) {
+    std::size_t const needed = (cells + threads_per_block - 1) / threads_per_block;
+    return static_cast<std::uint32_t>(std::min<std::size_t>(needed, 4096));
+}
+
+/** Fills the 16-bit shadow, reporting the width the sweep can actually use. */
+inline graph_width_t narrow_graph_(std::size_t cells, votes_count_t const* graph, std::uint16_t* narrow,
+                                   votes_count_t* overflowed) {
+    constexpr std::uint32_t threads_per_block = 256;
+    *overflowed = 0;
+    cuda_narrow_<<<flat_blocks_(cells, threads_per_block), threads_per_block>>>(cells, graph, narrow, overflowed);
+    cudaError_t const error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    return *overflowed != 0 ? graph_width_t::wide_32_k : graph_width_t::narrow_16_k;
+}
+
+/** Copies the 16-bit shadow back over the graph the caller owns. */
+inline void widen_graph_(std::size_t cells, std::uint16_t const* narrow, votes_count_t* graph) {
+    constexpr std::uint32_t threads_per_block = 256;
+    cuda_widen_<<<flat_blocks_(cells, threads_per_block), threads_per_block>>>(cells, narrow, graph);
+    cudaError_t const error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 
 /**
  *  @brief Computes the strongest paths for the block-parallel Schulze voting algorithm in CUDA or @b HIP.
@@ -650,20 +736,16 @@ tma_descriptor_t require_tma_(votes_count_t*, candidate_index_t, cudaDeviceProp 
  *  @param[out] graph The output matrix of strongest paths.
  *  @param[in] graph_stride The row stride of the padded output.
  *  @param[in] backend Which GPU family to launch.
+ *
+ *  On sm_90 the per-thread backend narrows the graph to 16 bits and runs the independent phase two
+ *  candidates per word, falling back to the 32-bit sweep when any vote count reaches 65536.
  */
 template <std::uint32_t tile_size_> //
 void compute_strongest_paths_cuda(  //
     votes_count_t* preferences, candidate_index_t num_candidates, candidate_index_t row_stride, votes_count_t* graph,
     candidate_index_t graph_stride, backend_t backend) {
 
-#if defined(SCALING_ELECTIONS_WITH_OPENMP)
-#pragma omp parallel for collapse(2)
-#endif
-    for (candidate_index_t i = 0; i < num_candidates; i++)
-        for (candidate_index_t j = 0; j < num_candidates; j++)
-            graph[i * graph_stride + j] = i != j && preferences[i * row_stride + j] > preferences[j * row_stride + i]
-                                              ? preferences[i * row_stride + j]
-                                              : 0;
+    winning_votes_graph(preferences, num_candidates, row_stride, graph, graph_stride);
 
     // Check if we can use newer CUDA features.
     cudaError_t error;
@@ -678,17 +760,18 @@ void compute_strongest_paths_cuda(  //
                                      ? require_tma_<tile_size_>(graph, graph_stride, device_properties)
                                      : tma_descriptor_t {std::nullopt};
 
-    candidate_index_t tiles_count = graph_stride / tile_size_;
-    dim3 tile_shape(tile_size_, tile_size_, 1);
-    dim3 independent_grid(tiles_count, tiles_count, 1);
-    for (candidate_index_t k = 0; k < tiles_count; k++) {
-        cuda_diagonal_<tile_size_><<<1, tile_shape>>>(graph_stride, k, graph);
-        cuda_partially_independent_<tile_size_><<<tiles_count, tile_shape>>>(graph_stride, k, graph);
-        launch_independent_<tile_size_>(independent_grid, tile_shape, graph_stride, k, graph, tma, backend);
-
-        error = cudaGetLastError();
-        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    std::size_t const cells = static_cast<std::size_t>(graph_stride) * graph_stride;
+    if (choose_width_<tile_size_>(backend, device_properties) == graph_width_t::narrow_16_k) {
+        managed_graph<std::uint16_t> narrow(cells * sizeof(std::uint16_t));
+        managed_graph<votes_count_t> overflowed(sizeof(votes_count_t));
+        if (narrow_graph_(cells, graph, narrow.pointer, overflowed.pointer) == graph_width_t::narrow_16_k) {
+            sweep_narrow_<tile_size_>(graph_stride, narrow.pointer);
+            widen_graph_(cells, narrow.pointer, graph);
+            return;
+        }
     }
+
+    sweep_wide_<tile_size_>(graph_stride, graph, tma, backend);
 }
 
 #endif // defined(SCALING_ELECTIONS_WITH_CUDA)
@@ -697,28 +780,6 @@ void compute_strongest_paths_cuda(  //
 
 #pragma region OpenMP
 
-#if defined(SCALING_ELECTIONS_WITH_OPENMP)
-
-/** @brief Fixes the team size for one call, restoring the runtime's prior settings on scope exit. */
-struct openmp_team_t {
-    int const previous_threads;
-    int const previous_dynamic;
-
-    explicit openmp_team_t(unsigned threads)
-        : previous_threads(omp_get_max_threads()), previous_dynamic(omp_get_dynamic()) {
-        omp_set_dynamic(0);
-        // `hardware_concurrency` is permitted to answer zero, which OpenMP rejects.
-        if (threads > 0) omp_set_num_threads(static_cast<int>(threads));
-    }
-    ~openmp_team_t() noexcept {
-        omp_set_num_threads(previous_threads);
-        omp_set_dynamic(previous_dynamic);
-    }
-    openmp_team_t(openmp_team_t const&) = delete;
-    openmp_team_t& operator=(openmp_team_t const&) = delete;
-};
-
-#endif
 /**
  *  @brief Processes a tile of the preferences matrix for the block-parallel Schulze
  *      voting algorithm on CPU using @b OpenMP.
@@ -748,11 +809,7 @@ inline void process_tile_openmp_(                     //
                 uint32x4_t a_vec = vdupq_n_u32(a[bi][k]);
                 uint32x4_t is_not_diagonal_a = vmvnq_u32(vceqq_u32(vdupq_n_u32(a_row + bi), vdupq_n_u32(a_col + k)));
                 uint32x4_t c_row_plus_bi_vec = vdupq_n_u32(c_row + bi);
-#if defined(__clang__) // Apple's Clang can't handle `#pragma unroll`
-#pragma clang loop unroll(full)
-#else
-#pragma unroll full
-#endif
+                SCALING_ELECTIONS_UNROLL
                 for (candidate_index_t bj = 0; bj < tile_size_; bj += 4) {
                     votes_count_t* c_ptr = &c[bi][bj];
                     uint32x4_t c_vec = vld1q_u32(c_ptr);
@@ -810,11 +867,7 @@ void memcpy2d(votes_count_t const* source, candidate_index_t stride, votes_count
     if constexpr (std::is_same<votes_count_t, std::uint32_t>() && tile_size_ % 4 == 0 &&
                   march_ == tile_march_t::fast_k) {
         for (candidate_index_t i = 0; i < tile_size_; i++) {
-#if defined(__clang__) // Apple's Clang can't handle `#pragma unroll`
-#pragma clang loop unroll(full)
-#else
-#pragma unroll full
-#endif
+            SCALING_ELECTIONS_UNROLL
             for (candidate_index_t j = 0; j < tile_size_; j += 4) {
                 vst1q_u32(&target[i][j], vld1q_u32(&source[i * stride + j]));
             }
@@ -838,11 +891,7 @@ void memcpy2d(votes_count_tile<tile_size_> const& source, candidate_index_t stri
     if constexpr (std::is_same<votes_count_t, std::uint32_t>() && tile_size_ % 4 == 0 &&
                   march_ == tile_march_t::fast_k) {
         for (candidate_index_t i = 0; i < tile_size_; i++) {
-#if defined(__clang__) // Apple's Clang can't handle `#pragma unroll`
-#pragma clang loop unroll(full)
-#else
-#pragma unroll full
-#endif
+            SCALING_ELECTIONS_UNROLL
             for (candidate_index_t j = 0; j < tile_size_; j += 4) {
                 vst1q_u32(&target[i * stride + j], vld1q_u32(&source[i][j]));
             }
@@ -858,26 +907,29 @@ void memcpy2d(votes_count_tile<tile_size_> const& source, candidate_index_t stri
             else target[i * stride + j] = source[i][j];
 }
 
-template <std::uint32_t tile_size_, tile_march_t march_ = tile_march_t::fast_k> //
-void compute_strongest_paths_openmp(                                            //
-    votes_count_t* preferences, candidate_index_t num_candidates, candidate_index_t row_stride, votes_count_t* graph) {
+/**
+ *  @brief Computes the strongest paths for the block-parallel Schulze voting algorithm using @b OpenMP.
+ *
+ *  @tparam tile_size_ The size of the tile to be processed.
+ *  @tparam march_ Whether tile copies bounds-check their edges.
+ *  @param[in] preferences The preferences matrix.
+ *  @param[in] num_candidates The number of candidates.
+ *  @param[in] row_stride The stride between rows in the preferences matrix.
+ *  @param[out] graph The output matrix of strongest paths, packed to @p num_candidates per row.
+ *  @param[in] cancelled Polled between pivots, aborting the run once it reads non-zero.
+ */
+template <std::uint32_t tile_size_, tile_march_t march_ = tile_march_t::fast_k>                 //
+void compute_strongest_paths_openmp(                                                            //
+    votes_count_t* preferences, candidate_index_t num_candidates, candidate_index_t row_stride, //
+    votes_count_t* graph, volatile std::sig_atomic_t const* cancelled = nullptr) {
 
-#pragma omp parallel for schedule(dynamic) collapse(2)
-    // Populate the strongest paths matrix based on direct comparisons
-    for (candidate_index_t i = 0; i < num_candidates; i++)
-        for (candidate_index_t j = 0; j < num_candidates; j++)
-            if (i != j)
-                graph[i * num_candidates + j] =                                       //
-                    preferences[i * row_stride + j] > preferences[j * row_stride + i] //
-                        ? preferences[i * row_stride + j]
-                        : 0;
-            else graph[i * num_candidates + j] = 0;
+    winning_votes_graph(preferences, num_candidates, row_stride, graph, num_candidates);
 
     // Time for the actual core implementation
     candidate_index_t const tiles_count = (num_candidates + tile_size_ - 1) / tile_size_;
     for (candidate_index_t k = 0; k < tiles_count; k++) {
 
-        if (global_signal_status != 0) throw std::runtime_error("Stopped by signal");
+        if (cancelled && *cancelled) throw std::runtime_error("Stopped by signal");
 
         // Dependent phase
         {
@@ -967,169 +1019,3 @@ void compute_strongest_paths_openmp(                                            
 }
 
 #pragma endregion OpenMP
-
-#pragma region Python bindings
-#if !defined(SCALING_ELECTIONS_TEST)
-
-/**
- *  @brief Computes the strongest paths for the block-parallel Schulze voting algorithm.
- *
- *  @param[in] preferences The preferences matrix.
- *  @param[in] backend_name One of `cpu_openmp`, `gpu_serial`, or `gpu_hopper`.
- *  @param[in] tile_size_ The tile edge, or zero to pick the largest that fits.
- *  @return A NumPy array containing the strongest paths matrix.
- *
- *  @note A backend the build or the device cannot serve raises rather than downgrading.
- */
-static py::array_t<votes_count_t> compute_strongest_paths(      //
-    py::array_t<votes_count_t, py::array::c_style> preferences, //
-    std::string_view backend_name, std::size_t tile_size = 0) {
-
-    backend_t const backend = backend_from_name(backend_name);
-
-    auto buffer = preferences.request();
-    if (buffer.ndim != 2) throw std::runtime_error("Number of dimensions must be two");
-    if (buffer.shape[0] != buffer.shape[1]) throw std::runtime_error("Preferences matrix must be square");
-    auto preferences_ptr = reinterpret_cast<votes_count_t*>(buffer.ptr);
-    auto num_candidates = static_cast<candidate_index_t>(buffer.shape[0]);
-    auto row_stride = static_cast<candidate_index_t>(buffer.strides[0] / sizeof(votes_count_t));
-
-    // Allocate NumPy array for the result
-    auto result = py::array_t<votes_count_t>({num_candidates, num_candidates});
-    auto result_buf = result.request();
-    auto result_ptr = reinterpret_cast<votes_count_t*>(result_buf.ptr);
-    auto result_row_stride = static_cast<candidate_index_t>(result_buf.strides[0] / sizeof(votes_count_t));
-    if (result_row_stride != num_candidates) throw std::runtime_error("Result matrix must be contiguous");
-
-#if defined(SCALING_ELECTIONS_WITH_CUDA)
-
-    if (backend != backend_t::cpu_openmp_k) {
-        if (tile_size == 0) tile_size = 32;
-        // Validate before reserving, so an unsupported size never allocates.
-        if (!gpu_tiles_t::contains(tile_size)) throw std::runtime_error("Unsupported tile size");
-
-        // Rounding the matrix up to a whole number of tiles keeps the kernels free of tail
-        // checks: the padding is zero, which is the identity of the max-min semiring.
-        candidate_index_t const graph_stride = (num_candidates + tile_size - 1) / tile_size * tile_size;
-        std::size_t const graph_bytes = static_cast<std::size_t>(graph_stride) * graph_stride * sizeof(votes_count_t);
-
-        managed_graph_t const graph(graph_bytes);
-        cudaError_t error = cudaMemset(graph.pointer, 0, graph_bytes);
-        if (error != cudaSuccess) throw std::runtime_error("Failed to clear device memory");
-        error = cudaDeviceSynchronize();
-        if (error != cudaSuccess) throw std::runtime_error("Failed to clear device memory");
-
-        gpu_tiles_t::dispatch(tile_size, [&](auto tile) {
-            compute_strongest_paths_cuda<tile.value>(preferences_ptr, num_candidates, row_stride, graph.pointer,
-                                                     graph_stride, backend);
-        });
-
-        error = cudaDeviceSynchronize();
-        if (error != cudaSuccess) throw std::runtime_error("CUDA operations did not complete successfully");
-
-        // Copy the leading sub-block back, dropping the padding.
-        error = cudaMemcpy2D(result_ptr, num_candidates * sizeof(votes_count_t), graph.pointer,
-                             graph_stride * sizeof(votes_count_t), num_candidates * sizeof(votes_count_t),
-                             num_candidates, cudaMemcpyDeviceToHost);
-        if (error != cudaSuccess) throw std::runtime_error("Failed to copy data from device to host");
-
-        error = cudaDeviceSynchronize();
-        if (error != cudaSuccess) throw std::runtime_error("CUDA transfers did not complete successfully");
-        return result;
-    }
-
-#else
-
-    if (backend != backend_t::cpu_openmp_k) throw std::runtime_error("This build has no GPU support compiled in");
-
-#endif // defined(SCALING_ELECTIONS_WITH_CUDA)
-
-#if defined(SCALING_ELECTIONS_WITH_OPENMP)
-    openmp_team_t const team(std::thread::hardware_concurrency());
-#endif
-
-    // Probe for the largest possible tile size, if not previously specified
-    if (tile_size == 0) tile_size = cpu_tiles_t::largest_fitting(num_candidates);
-    if (tile_size == 0) throw std::runtime_error("Number of candidates should be at least 4, ideally divisible by 4");
-    if (tile_size > num_candidates)
-        throw std::runtime_error("Tile size should be less than or equal to the number of candidates");
-
-    bool const dispatched = cpu_tiles_t::dispatch(tile_size, [&](auto tile) {
-        if (num_candidates % tile.value == 0)
-            compute_strongest_paths_openmp<tile.value, tile_march_t::fast_k>( //
-                preferences_ptr, num_candidates, row_stride, result_ptr);
-        else
-            compute_strongest_paths_openmp<tile.value, tile_march_t::checked_k>( //
-                preferences_ptr, num_candidates, row_stride, result_ptr);
-    });
-    if (!dispatched) throw std::runtime_error("Unsupported tile size");
-    return result;
-}
-
-PYBIND11_MODULE(scaling_elections, m) {
-
-    std::signal(SIGINT, signal_handler);
-
-    // Let's show how to wrap `void` functions for basic logging
-    m.def("log_gpus", []() {
-#if defined(SCALING_ELECTIONS_WITH_CUDA)
-        int device_count;
-        cudaDeviceProp device_properties;
-        cudaError_t error = cudaGetDeviceCount(&device_count);
-        if (error != cudaSuccess) throw std::runtime_error("Failed to get device count");
-        for (int i = 0; i < device_count; i++) {
-            error = cudaGetDeviceProperties(&device_properties, i);
-            if (error != cudaSuccess) throw std::runtime_error("Failed to get device properties");
-            std::printf("Device %d: %s\n", i, device_properties.name);
-            std::printf("\tSMs: %d\n", device_properties.multiProcessorCount);
-            std::printf("\tGlobal mem: %.2fGB\n",
-                        static_cast<float>(device_properties.totalGlobalMem) / (1024 * 1024 * 1024));
-            std::printf("\tCUDA Cap: %d.%d\n", device_properties.major, device_properties.minor);
-        }
-#else
-        throw std::runtime_error("No CUDA devices available\n");
-#endif
-    });
-
-    // This is how we could have used `thrust::` for higher-level operations
-    m.def("reduce", [](py::array_t<float> const& data) -> float {
-#if defined(SCALING_ELECTIONS_WITH_CUDA) && !defined(SCALING_ELECTIONS_WITH_HIP)
-        // Thrust support - CUDA only (rocThrust not guaranteed to be available)
-        py::buffer_info buffer = data.request();
-        if (buffer.ndim != 1 || buffer.strides[0] != sizeof(float))
-            throw std::runtime_error("Input should be a contiguous 1D float array");
-        float* ptr = static_cast<float*>(buffer.ptr);
-        thrust::device_vector<float> d_data(ptr, ptr + buffer.size);
-        return thrust::reduce(thrust::device, d_data.begin(), d_data.end(), 0.0f);
-#else
-        // CPU fallback for HIP and non-CUDA builds
-        return std::accumulate(data.data(), data.data() + data.size(), 0.0f);
-#endif
-    });
-
-    m.def("compute_strongest_paths", &compute_strongest_paths, //
-          py::arg("preferences"), py::kw_only(),               //
-          py::arg("backend") = "cpu_openmp",                   //
-          py::arg("tile_size") = 0);
-}
-
-#endif // !defined(SCALING_ELECTIONS_TEST)
-#pragma endregion Python bindings
-
-#if defined(SCALING_ELECTIONS_TEST)
-
-int main() {
-
-    std::size_t num_candidates = 256;
-    std::vector<votes_count_t> preferences(num_candidates * num_candidates);
-    std::generate(preferences.begin(), preferences.end(),
-                  [=]() { return static_cast<votes_count_t>(std::rand() % num_candidates); });
-
-    std::vector<votes_count_t> graph(num_candidates * num_candidates);
-    compute_strongest_paths_openmp<64, tile_march_t::fast_k>( //
-        preferences.data(), num_candidates, num_candidates, graph.data());
-
-    return 0;
-}
-
-#endif // defined(SCALING_ELECTIONS_TEST)

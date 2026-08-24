@@ -56,6 +56,8 @@ def detect_cuda_archs():
     return requested or list(DEFAULT_CUDA_ARCHS)
 
 
+HEADERS = ["types.cuh", "ballots.cuh", "schulze.cuh", "kemeny.cuh"]
+
 cuda_available = has_cuda()
 rocm_available = has_rocm()
 is_macos = platform.system() == "Darwin"
@@ -102,7 +104,7 @@ class BuildExt(build_ext):
 
         # Link all object files
         self.compiler.link_shared_object(
-            objects + [os.path.join(self.build_temp, "scaling_elections.o")],
+            objects + [os.path.join(self.build_temp, "scalingelections.o")],
             self.get_ext_fullpath(ext.name),
             libraries=ext.libraries,
             library_dirs=ext.library_dirs,
@@ -128,7 +130,7 @@ class BuildExt(build_ext):
 
         # Link all object files
         self.compiler.link_shared_object(
-            objects + [os.path.join(self.build_temp, "scaling_elections.o")],
+            objects + [os.path.join(self.build_temp, "scalingelections.o")],
             self.get_ext_fullpath(ext.name),
             libraries=ext.libraries,
             library_dirs=ext.library_dirs,
@@ -201,7 +203,7 @@ class BuildExt(build_ext):
         os.makedirs(output_dir, exist_ok=True)
         include_dirs = self.compiler.include_dirs + ext.include_dirs
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
-        output_file = os.path.join(output_dir, "scaling_elections.o")
+        output_file = os.path.join(output_dir, "scalingelections.o")
 
         arch_codes = detect_cuda_archs()
         # SASS for every target, PTX only for the newest so older toolkits can still JIT forward.
@@ -228,7 +230,7 @@ class BuildExt(build_ext):
         os.makedirs(output_dir, exist_ok=True)
         include_dirs = self.compiler.include_dirs + ext.include_dirs
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
-        output_file = os.path.join(output_dir, "scaling_elections.o")
+        output_file = os.path.join(output_dir, "scalingelections.o")
 
         # Detect AMD GPU architecture
         # Common AMD architectures:
@@ -309,8 +311,9 @@ if cuda_available:
     print("Building with CUDA support")
     ext_modules = [
         Extension(
-            "scaling_elections",
-            ["scaling_elections.cu"],
+            "scalingelections_cuda",
+            ["scalingelections.cu"],
+            depends=HEADERS,
             include_dirs=[
                 pybind11.get_include(),
                 python_include,
@@ -340,8 +343,9 @@ elif rocm_available:
     print("Building with ROCm/HIP support")
     ext_modules = [
         Extension(
-            "scaling_elections",
-            ["scaling_elections.cu"],  # HIP can compile CUDA-style code
+            "scalingelections_cuda",
+            ["scalingelections.cu"],  # HIP can compile CUDA-style code
+            depends=HEADERS,
             include_dirs=[
                 pybind11.get_include(),
                 python_include,
@@ -373,8 +377,9 @@ else:
         print("Building CPU-only (macOS, no OpenMP) - No GPU support available")
         ext_modules = [
             Extension(
-                "scaling_elections",
-                ["scaling_elections.cu"],  # Will be compiled as C++ with clang
+                "scalingelections_cuda",
+                ["scalingelections.cu"],  # Will be compiled as C++ with clang
+                depends=HEADERS,
                 include_dirs=[
                     pybind11.get_include(),
                     python_include,
@@ -395,8 +400,9 @@ else:
         print("Building CPU-only (OpenMP) - No GPU support (CUDA/ROCm) available")
         ext_modules = [
             Extension(
-                "scaling_elections",
-                ["scaling_elections.cu"],  # Will be compiled as C++ with GCC
+                "scalingelections_cuda",
+                ["scalingelections.cu"],  # Will be compiled as C++ with GCC
+                depends=HEADERS,
                 include_dirs=[
                     pybind11.get_include(),
                     python_include,
@@ -425,7 +431,7 @@ setup(
     author_email="1983160+ashvardanian@users.noreply.github.com",
     url="https://ashvardanian.com/posts/scaling-elections",
     project_urls={"Repository": "https://github.com/ashvardanian/ScalingElections"},
-    description="GPU-accelerated Schulze voting algorithm",
+    description="ScalingElections: Condorcet Voting at GPU Speed — Schulze as semiring matrix multiplication, Kemeny-Young as exact NP-hard search",
     long_description=long_description,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt},

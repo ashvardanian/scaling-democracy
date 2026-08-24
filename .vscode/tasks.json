@@ -7,8 +7,8 @@
       "command": "/usr/local/cuda/bin/nvcc",
       "args": [
         "-o",
-        "${workspaceFolder}/build_debug/scaling_elections",
-        "${workspaceFolder}/scaling_elections.cu",
+        "${workspaceFolder}/build_debug/scalingelections",
+        "${workspaceFolder}/scalingelections.cu",
         "-Xcompiler",
         "-fopenmp",
         "-fsanitize=address",
@@ -30,10 +30,10 @@
       "command": "g++",
       "args": [
         "-o",
-        "${workspaceFolder}/build_debug/scaling_elections",
+        "${workspaceFolder}/build_debug/scalingelections",
         "-x",
         "c++",
-        "${workspaceFolder}/scaling_elections.cu",
+        "${workspaceFolder}/scalingelections.cu",
         "-fopenmp",
         "-fsanitize=address",
         "-fsanitize=undefined",
